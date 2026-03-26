@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.env
+
+# Data — CSVs and generated rule blocks are reproduced by the pipeline
+data/raw_csv/
+data/raw_csv_archive/
+data/rule_blocks/
+data/last_synced_hash.txt
+data/ingest_manifest.json
+
+# ChromaDB — large binary, reproduced by ingest.py --reset
+chroma_db/
+
+# SQLite conversation archive — user data, not source code
+judge.db
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
