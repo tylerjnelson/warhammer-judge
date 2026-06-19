@@ -11,7 +11,10 @@ data/raw_csv/
 data/raw_csv_archive/
 data/rule_blocks/
 data/last_synced_hash.txt
+data/last_synced_hash_*.txt
 data/ingest_manifest.json
+data/ingest_manifest_*.json
+data/html_cache/
 
 # ChromaDB — large binary, reproduced by ingest.py --reset
 chroma_db/
@@ -25,3 +28,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Spec
+spec/

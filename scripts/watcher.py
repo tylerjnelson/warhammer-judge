@@ -30,17 +30,17 @@ import requests
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-ROOT        = Path(__file__).resolve().parent.parent
-CSV_DIR     = ROOT / "data" / "raw_csv"
-ARCHIVE_DIR = ROOT / "data" / "raw_csv_archive"
-HASH_FILE   = ROOT / "data" / "last_synced_hash.txt"
-LOG_DIR     = ROOT / "logs"
+ROOT    = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+import config
 
+LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Wahapedia CSV file list ───────────────────────────────────────────────────
+# Per-edition locals (base_url / csv_dir / archive_dir / hash_file) are resolved
+# inside run() from config.get_edition(code) for each active edition.
 
-BASE_URL = "https://wahapedia.ru/wh40k10ed"
+# ── Wahapedia CSV file list ───────────────────────────────────────────────────
 
 CSV_FILES = [
     "Datasheets.csv",
@@ -68,71 +68,71 @@ def log(msg):
 def md5(content: bytes) -> str:
     return hashlib.md5(content).hexdigest()
 
-def read_hash() -> str:
-    if HASH_FILE.exists():
-        return HASH_FILE.read_text().strip()
+def read_hash(hash_file) -> str:
+    if hash_file.exists():
+        return hash_file.read_text().strip()
     return ""
 
-def write_hash(hash_: str):
-    HASH_FILE.write_text(hash_)
+def write_hash(hash_file, hash_: str):
+    hash_file.write_text(hash_)
 
 # ── Change detection ──────────────────────────────────────────────────────────
 
-def fetch_remote_hash() -> tuple[str, bytes]:
+def fetch_remote_hash(base_url, code) -> tuple[str, bytes]:
     """Fetch Last_update.csv and return (md5_hash, raw_content)."""
-    url = f"{BASE_URL}/Last_update.csv"
+    url = f"{base_url}/Last_update.csv"
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         return md5(resp.content), resp.content
     except requests.RequestException as e:
-        log(f"[ERROR] Failed to fetch Last_update.csv: {e}")
+        log(f"[{code}] [ERROR] Failed to fetch Last_update.csv: {e}")
         sys.exit(1)
 
 # ── Archive ───────────────────────────────────────────────────────────────────
 
-def archive_current_csvs():
-    """Copy current raw CSVs to archive dir before overwriting."""
-    if not CSV_DIR.exists():
+def archive_current_csvs(csv_dir, archive_dir, code):
+    """Copy current raw CSVs to the edition archive dir before overwriting."""
+    if not csv_dir.exists():
         return
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    for f in CSV_DIR.glob("*.csv"):
-        shutil.copy2(f, ARCHIVE_DIR / f.name)
-    log(f"Archived {len(list(CSV_DIR.glob('*.csv')))} CSVs to {ARCHIVE_DIR}")
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for f in csv_dir.glob("*.csv"):
+        shutil.copy2(f, archive_dir / f.name)
+    log(f"[{code}] Archived {len(list(csv_dir.glob('*.csv')))} CSVs to {archive_dir}")
 
 # ── Download ──────────────────────────────────────────────────────────────────
 
-def download_csvs():
-    """Download all Wahapedia CSVs to data/raw_csv/."""
-    CSV_DIR.mkdir(parents=True, exist_ok=True)
+def download_csvs(base_url, csv_dir, code):
+    """Download all Wahapedia CSVs to the edition CSV dir."""
+    csv_dir.mkdir(parents=True, exist_ok=True)
     failed = []
     for filename in CSV_FILES:
-        url = f"{BASE_URL}/{filename}"
+        url = f"{base_url}/{filename}"
         try:
             resp = requests.get(url, timeout=60)
             resp.raise_for_status()
-            (CSV_DIR / filename).write_bytes(resp.content)
+            (csv_dir / filename).write_bytes(resp.content)
         except requests.RequestException as e:
-            log(f"[WARN] Failed to download {filename}: {e}")
+            log(f"[{code}] [WARN] Failed to download {filename}: {e}")
             failed.append(filename)
 
     if failed:
-        log(f"[WARN] {len(failed)} file(s) failed to download: {failed}")
+        log(f"[{code}] [WARN] {len(failed)} file(s) failed to download: {failed}")
     else:
-        log(f"Downloaded {len(CSV_FILES)} CSVs successfully")
+        log(f"[{code}] Downloaded {len(CSV_FILES)} CSVs successfully")
 
     return len(failed) == 0
 
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
-def run_scrape() -> bool:
+def run_scrape(code) -> bool:
     """
-    Scrape Core Rules and Leviathan HTML pages.
+    Scrape the edition's Core Rules and mission-pack HTML pages.
     Returns True if any files were written (i.e. content changed).
     """
-    log("Scraping rules pages...")
+    log(f"[{code}] Scraping rules pages...")
     result = subprocess.run(
-        [sys.executable, ROOT / "scripts" / "scrape_rules.py"],
+        [sys.executable, ROOT / "scripts" / "scrape_rules.py", "--edition", code],
         cwd=ROOT,
         capture_output=True,
         text=True
@@ -140,7 +140,7 @@ def run_scrape() -> bool:
     if result.stdout:
         log(result.stdout.strip())
     if result.returncode != 0:
-        log(f"[ERROR] Scraper failed:\n{result.stderr}")
+        log(f"[{code}] [ERROR] Scraper failed:\n{result.stderr}")
         sys.exit(1)
 
     # Parse written count from output: "Scrape complete: N written, M skipped"
@@ -148,10 +148,10 @@ def run_scrape() -> bool:
     written = int(match.group(1)) if match else 0
     return written > 0
 
-def run_etl():
-    log("Running ETL pipeline...")
+def run_etl(code):
+    log(f"[{code}] Running ETL pipeline...")
     result = subprocess.run(
-        [sys.executable, ROOT / "scripts" / "etl.py"],
+        [sys.executable, ROOT / "scripts" / "etl.py", "--edition", code],
         cwd=ROOT,
         capture_output=True,
         text=True
@@ -159,13 +159,13 @@ def run_etl():
     if result.stdout:
         log(result.stdout.strip())
     if result.returncode != 0:
-        log(f"[ERROR] ETL failed:\n{result.stderr}")
+        log(f"[{code}] [ERROR] ETL failed:\n{result.stderr}")
         sys.exit(1)
 
-def run_ingest():
-    log("Running ingest pipeline...")
+def run_ingest(code):
+    log(f"[{code}] Running ingest pipeline...")
     result = subprocess.run(
-        [sys.executable, ROOT / "scripts" / "ingest.py"],
+        [sys.executable, ROOT / "scripts" / "ingest.py", "--edition", code],
         cwd=ROOT,
         capture_output=True,
         text=True
@@ -173,7 +173,7 @@ def run_ingest():
     if result.stdout:
         log(result.stdout.strip())
     if result.returncode != 0:
-        log(f"[ERROR] Ingest failed:\n{result.stderr}")
+        log(f"[{code}] [ERROR] Ingest failed:\n{result.stderr}")
         sys.exit(1)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -182,52 +182,67 @@ def run(force=False):
     log("=" * 50)
     log("Watcher starting")
 
+    # Service every active edition in turn. Inactive editions (e.g. 11e until
+    # release) are absent from active_editions(), so the loop skips them with no
+    # code change needed at launch — only the config flag flips.
+    for code in config.active_editions():
+        sync_edition(code, force=force)
+
+    log("=" * 50)
+
+def sync_edition(code, force=False):
+    """Run the full change-detection + pipeline for a single edition."""
+    ed          = config.get_edition(code)
+    base_url    = ed["wahapedia_base"]
+    csv_dir     = ROOT / ed["csv_dir"]
+    archive_dir = ROOT / ed["csv_archive_dir"]
+    hash_file   = ROOT / ed["hash_file"]
+
+    log(f"[{code}] --- {ed['label']} ---")
+
     # ── Step 1: Always scrape HTML rules pages ──
     # Last_update.csv has no awareness of HTML page changes.
     # The scraper's own manifest detects actual content changes cheaply.
-    scrape_changed = run_scrape()
+    scrape_changed = run_scrape(code)
 
     # ── Step 2: Check Wahapedia CSV exports for changes ──
-    new_hash, _  = fetch_remote_hash()
-    local_hash   = read_hash()
+    new_hash, _  = fetch_remote_hash(base_url, code)
+    local_hash   = read_hash(hash_file)
     csv_changed  = force or (new_hash != local_hash)
 
     if force:
-        log("--force flag set: running full sync")
+        log(f"[{code}] --force flag set: running full sync")
     elif csv_changed:
-        log("CSV change detected")
+        log(f"[{code}] CSV change detected")
     else:
-        log("No CSV changes detected")
+        log(f"[{code}] No CSV changes detected")
 
     # ── Step 3: Exit early if nothing changed anywhere ──
     if not csv_changed and not scrape_changed:
-        log("No changes detected anywhere. Exiting.")
-        log("=" * 50)
+        log(f"[{code}] No changes detected anywhere. Skipping.")
         return
 
     # ── Step 4: If CSVs changed, run full download + ETL ──
     if csv_changed:
-        archive_current_csvs()
+        archive_current_csvs(csv_dir, archive_dir, code)
 
-        log("Downloading CSVs from Wahapedia...")
-        success = download_csvs()
+        log(f"[{code}] Downloading CSVs from Wahapedia...")
+        success = download_csvs(base_url, csv_dir, code)
         if not success:
-            log("[ERROR] Some CSVs failed to download. Aborting to preserve last good state.")
-            log("=" * 50)
+            log(f"[{code}] [ERROR] Some CSVs failed to download. Aborting to preserve last good state.")
             sys.exit(1)
 
-        run_etl()
+        run_etl(code)
 
     # ── Step 5: Re-embed everything that changed (CSV blocks + scraped files) ──
-    run_ingest()
+    run_ingest(code)
 
     # ── Step 6: Record new CSV hash only after successful sync ──
     if csv_changed:
-        write_hash(new_hash)
-        log(f"CSV hash updated to {new_hash[:8]}...")
+        write_hash(hash_file, new_hash)
+        log(f"[{code}] CSV hash updated to {new_hash[:8]}...")
 
-    log("Sync complete.")
-    log("=" * 50)
+    log(f"[{code}] Sync complete.")
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

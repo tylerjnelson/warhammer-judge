@@ -28,8 +28,10 @@ Usage:
 import sys
 import re
 import json
+import logging
 import hashlib
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 import chromadb
@@ -37,28 +39,31 @@ from chromadb.utils import embedding_functions
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-ROOT             = Path(__file__).resolve().parent.parent
-BLOCKS_DIR       = ROOT / "data" / "rule_blocks"
-CHROMA_DIR       = ROOT / "chroma_db"
-INGEST_MANIFEST  = ROOT / "data" / "ingest_manifest.json"
+ROOT       = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+import config
+
+CHROMA_DIR = ROOT / "chroma_db"   # shared across editions; collection differs
+
+# Per-edition paths (blocks_dir / ingest_manifest / collection) are resolved
+# inside run() from config.get_edition(edition).
 
 # ── ChromaDB setup ────────────────────────────────────────────────────────────
 
-COLLECTION_NAME = "warhammer_rules"
-
-def get_collection(reset=False):
+def get_collection(reset=False, edition="10e"):
+    collection_name = config.get_edition(edition)["collection"]
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="all-MiniLM-L6-v2"
     )
     if reset:
         try:
-            client.delete_collection(COLLECTION_NAME)
+            client.delete_collection(collection_name)
         except Exception:
             pass
 
     collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
+        name=collection_name,
         embedding_function=emb_fn,
         metadata={"hnsw:space": "cosine"}
     )
@@ -66,14 +71,14 @@ def get_collection(reset=False):
 
 # ── Ingest manifest ───────────────────────────────────────────────────────────
 
-def load_ingest_manifest() -> dict:
-    if INGEST_MANIFEST.exists():
-        with open(INGEST_MANIFEST) as f:
+def load_ingest_manifest(manifest_path) -> dict:
+    if manifest_path.exists():
+        with open(manifest_path) as f:
             return json.load(f)
     return {}
 
-def save_ingest_manifest(manifest: dict):
-    with open(INGEST_MANIFEST, "w") as f:
+def save_ingest_manifest(manifest_path, manifest: dict):
+    with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
 def content_hash(text: str) -> str:
@@ -84,8 +89,9 @@ def content_hash(text: str) -> str:
 HEADER_RE = re.compile(r'\*\*Faction:\*\*\s*([^|]+?)\s*\|.*\*\*Source:\*\*\s*(\S+)')
 ERRATA_RE = re.compile(r'\*\(errata\)\*')
 
-def extract_metadata(filepath, content):
+def extract_metadata(filepath, content, edition_code="10e"):
     stem = filepath.stem
+    mp   = config.get_edition(edition_code)["mission_pack"]
 
     if stem.startswith("unit_"):
         category = "Datasheet"
@@ -99,9 +105,9 @@ def extract_metadata(filepath, content):
     elif stem.startswith("core_rules_"):
         category = "Core_Rules"
         doc_id   = stem[11:]
-    elif stem.startswith("leviathan_"):
-        category = "Leviathan"
-        doc_id   = stem[10:]
+    elif stem.startswith(mp["prefix"] + "_"):
+        category = mp["category"]
+        doc_id   = stem[len(mp["prefix"]) + 1:]
     else:
         category = "Unknown"
         doc_id   = stem
@@ -135,7 +141,135 @@ def extract_metadata(filepath, content):
         "source":     "Wahapedia",
         "priority":   priority,
         "source_id":  source_id,
+        "edition":    edition_code,
     }
+
+# ── Rules-block chunking (Layer 2 Tracks A & C) ───────────────────────────────
+
+STANDALONE_BOLD = re.compile(r'^\*\*([^*]+)\*\*\s*$')
+
+def split_card_deck(content):
+    """
+    Track A: split a card-deck block into per-card (name, body) pairs at
+    standalone-bold name lines (^**NAME**$). Returns [] unless there are >=3
+    such lines — i.e. only genuine multi-card decks split; prose/inline-bold
+    files (e.g. only_war) are left whole. Filename-agnostic, so 11e decks work.
+    """
+    lines = content.splitlines()
+    idxs  = [i for i, l in enumerate(lines) if STANDALONE_BOLD.match(l.strip())]
+    if len(idxs) < 3:
+        return []
+    cards = []
+    for j, start in enumerate(idxs):
+        end  = idxs[j + 1] if j + 1 < len(idxs) else len(lines)
+        name = STANDALONE_BOLD.match(lines[start].strip()).group(1).strip()
+        body = "\n".join(lines[start:end]).strip()
+        if body:
+            cards.append((name, body))
+    return cards
+
+def sequence_for(stem, edition_code):
+    """Track C: (group, seq) if this rule-block stem is a curated sequence member."""
+    for group, members in config.RULES_SEQUENCES.get(edition_code, {}).items():
+        if stem in members:
+            return group, members.index(stem) + 1
+    return None, None
+
+# Inline sub-rule lead: an ALL-CAPS rule name (1-4 caps words, >=4 chars) starting
+# a line, followed by a sentence-case word — e.g. "DEEP STRIKE Some units ...".
+# This is the delimiter Wahapedia's flattened styled name-spans leave behind; it
+# is what actually carries structure in the few bundled core files (bold does
+# not — 91/93 core files have none). See spec/retrieval.md (Layer 2 re-chunking).
+RULE_LEAD = re.compile(r"^([A-Z][A-Z'’\-]{1,}(?: [A-Z][A-Z'’\-]+){0,3}) ([A-Z][a-z].*)$")
+
+def split_subrules(content):
+    """
+    Split a rule block that bundles >=2 named sub-rules (each led by an ALL-CAPS
+    name) into (parent_body, [(name, body), ...]). parent_body is everything
+    before the first sub-rule — the file's main rule + intro, which KEEPS any
+    Track C sequence metadata. Returns (None, []) for <2 leads so single-rule and
+    prose files are left whole (mirrors split_card_deck's >=3 gate).
+    """
+    lines = content.splitlines()
+    idxs  = [(i, m.group(1)) for i, l in enumerate(lines)
+             if (m := RULE_LEAD.match(l.strip())) and len(m.group(1)) >= 4]
+    if len(idxs) < 2:
+        return None, []
+    first  = idxs[0][0]
+    parent = "\n".join(lines[:first]).strip()
+    subs   = []
+    for j, (start, name) in enumerate(idxs):
+        end  = idxs[j + 1][0] if j + 1 < len(idxs) else len(lines)
+        body = "\n".join(lines[start:end]).strip()
+        if body:
+            subs.append((name, body))
+    return parent, subs
+
+def build_rules_chunks(filepath, content, base_meta, edition_code):
+    """
+    Expand a Core_Rules / mission-pack file into ingest chunks:
+      • card decks -> one chunk per card (Track A),
+      • otherwise  -> the whole section as one chunk.
+    Adds a breadcrumb to every chunk and section_group/seq to curated-sequence
+    members (Track C). Returns list of (chunk_id, doc, meta) — meta has no doc_id.
+    """
+    base_id   = base_meta["doc_id"]
+    category  = base_meta["category"]
+    source_id = base_meta.get("source_id", "")
+    clean     = {k: v for k, v in base_meta.items() if k != "doc_id"}
+
+    heading = content.splitlines()[0][2:].strip() if content.startswith("# ") else filepath.stem
+    clean["breadcrumb"] = f"{category.replace('_', ' ')} > {heading}"
+
+    group, seq = sequence_for(filepath.stem, edition_code)
+    if group:
+        clean["section_group"] = group
+        clean["seq"]           = seq
+
+    # Track A: per-card split for multi-card decks (>=3 standalone-bold names).
+    cards = split_card_deck(content)
+    if cards:
+        out = []
+        for i, (name, body) in enumerate(cards):
+            meta = dict(clean)
+            meta["breadcrumb"] = f"{clean['breadcrumb']} > {name}"
+            meta["card_name"]  = name
+            out.append((f"{base_id}_card{i}", body, meta))
+        return out
+
+    # Sub-rule split: files bundling >=2 ALL-CAPS-named sub-rules (e.g.
+    # deployment_abilities → Deep Strike/Scouts/…; inflict_damage → Feel No Pain/
+    # Deadly Demise). Each named rule gets its own focused embedding instead of
+    # being averaged into — and bloating — the parent's vector.
+    parent_body, subs = split_subrules(content)
+    if not subs:
+        return [(base_id, content, dict(clean))]
+
+    out = []
+    if parent_body:
+        # Parent retains the main rule text AND any Track C section_group/seq.
+        out.append((base_id, parent_body, dict(clean)))
+    for i, (name, body) in enumerate(subs):
+        meta = dict(clean)
+        meta.pop("section_group", None)   # a sub-rule is not itself a sequence step
+        meta.pop("seq", None)
+        meta["breadcrumb"] = f"{clean['breadcrumb']} > {name.title()}"
+        meta["rule_name"]  = name.title()
+        sub_doc = (
+            f"# {heading} — {name.title()}\n"
+            f"**Category:** {category}  |  **Source:** {source_id}\n\n"
+            f"{body}"
+        )
+        out.append((f"{base_id}_sub{i}", sub_doc, meta))
+    return out
+
+def expand_file_to_chunks(filepath, content, base_meta, edition_code):
+    """Pass-1 chunks for a file: rules files may fan out (Track A); others are 1:1."""
+    mp_category = config.get_edition(edition_code)["mission_pack"]["category"]
+    if base_meta["category"] in ("Core_Rules", mp_category):
+        return build_rules_chunks(filepath, content, base_meta, edition_code)
+    clean = {k: v for k, v in base_meta.items() if k != "doc_id"}
+    return [(base_meta["doc_id"], content, clean)]
 
 # ── Ability extraction (Pass 2) ───────────────────────────────────────────────
 
@@ -171,6 +305,7 @@ def extract_abilities(content, base_meta):
             "source":     "Wahapedia",
             "priority":   base_meta.get("priority", 1),
             "source_id":  base_meta.get("source_id", ""),
+            "edition":    base_meta.get("edition", "10e"),
         }
         chunks.append((ab_id, ab_doc, ab_meta))
 
@@ -228,6 +363,7 @@ def extract_sections(content, base_meta):
             "source":       "Wahapedia",
             "priority":     base_meta.get("priority", 1),
             "source_id":    base_meta.get("source_id", ""),
+            "edition":      base_meta.get("edition", "10e"),
         }
         chunks.append((section_id, section_doc, section_meta))
 
@@ -246,7 +382,7 @@ def upsert_batch(collection, ids, documents, metadatas):
 
 # ── Main ingest ───────────────────────────────────────────────────────────────
 
-def ingest_files(collection, md_files, ingest_manifest, reset=False):
+def ingest_files(collection, md_files, ingest_manifest, reset=False, edition="10e"):
     p1_upsert  = 0
     p1_skip    = 0
     p2_upsert  = 0
@@ -270,24 +406,27 @@ def ingest_files(collection, md_files, ingest_manifest, reset=False):
 
     for filepath in md_files:
         content   = filepath.read_text(encoding="utf-8")
-        meta      = extract_metadata(filepath, content)
-        doc_id    = meta["doc_id"]
-        file_hash = content_hash(content)
+        base_meta = extract_metadata(filepath, content, edition)
 
-        if not reset and ingest_manifest.get(doc_id) == file_hash:
-            p1_skip += 1
-            continue
+        # Rules files may fan out into multiple chunks (Track A card decks);
+        # every other file stays 1:1. Each chunk is hashed by its own doc so
+        # incremental ingest tracks card chunks independently.
+        for chunk_id, doc, meta in expand_file_to_chunks(filepath, content, base_meta, edition):
+            chunk_hash = content_hash(doc)
+            if not reset and ingest_manifest.get(chunk_id) == chunk_hash:
+                p1_skip += 1
+                continue
 
-        batch_ids.append(doc_id)
-        batch_docs.append(content)
-        batch_metas.append({k: v for k, v in meta.items() if k != "doc_id"})
-        ingest_manifest[doc_id] = file_hash
-        p1_upsert += 1
+            batch_ids.append(chunk_id)
+            batch_docs.append(doc)
+            batch_metas.append(meta)
+            ingest_manifest[chunk_id] = chunk_hash
+            p1_upsert += 1
 
-        if len(batch_ids) >= BATCH_SIZE:
-            flush_batch()
-            print(f"\r    Upserted: {p1_upsert} new/changed, {p1_skip} skipped",
-                  end="", flush=True)
+            if len(batch_ids) >= BATCH_SIZE:
+                flush_batch()
+                print(f"\r    Upserted: {p1_upsert} new/changed, {p1_skip} skipped",
+                      end="", flush=True)
 
     flush_batch()
     print(f"\r    Upserted: {p1_upsert} new/changed, {p1_skip} skipped")
@@ -309,7 +448,7 @@ def ingest_files(collection, md_files, ingest_manifest, reset=False):
 
     for filepath in unit_files:
         content   = filepath.read_text(encoding="utf-8")
-        base_meta = extract_metadata(filepath, content)
+        base_meta = extract_metadata(filepath, content, edition)
         file_hash = content_hash(content)
         parent_id = base_meta["doc_id"]
 
@@ -366,17 +505,117 @@ def ingest_files(collection, md_files, ingest_manifest, reset=False):
 
     return p1_upsert, p1_skip, p2_upsert, p2_skip, p3_upsert, p3_skip
 
+# ── Post-ingest verification ──────────────────────────────────────────────────
+
+class _Tee:
+    """Write to several streams at once — used to capture the audit report to
+    both the console and a persisted log file in one pass."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+def verify_after_ingest(edition="10e", recall=True, strict=False):
+    """Audit the freshly-ingested corpus and persist a report for future audits.
+
+    Runs the two harnesses that bracket corpus quality:
+      • eval_completeness — every canonical rule's body is ingested AND retrievable
+      • eval_fidelity     — chunks are verbatim-accurate to source AND fully cover it
+
+    Both run for the core and Leviathan corpora. The full report is teed to a
+    timestamped file under logs/ (and logs/last_ingest_audit.log) so a regression
+    is diffable after the fact. Returns 0 on success, nonzero if strict and any
+    gate fails. Audit failures never corrupt the ingest itself — the collection is
+    already written by the time this runs.
+    """
+    tests_dir = ROOT / "tests"
+    sys.path.insert(0, str(tests_dir))
+    try:
+        import eval_completeness
+        import eval_fidelity
+    except Exception as e:                      # harness missing / import error
+        print(f"  [verify] skipped — could not import audit harnesses: {e}")
+        return 0
+
+    # The completeness/fidelity ground truth is the cached core + Leviathan HTML,
+    # which only ships for 10e. Other editions have no audit target — skip.
+    if edition != "10e" or not (ROOT / "data/html_cache/10e/core_rules.html").exists():
+        print("  [verify] skipped — no core/Leviathan source cache for this edition")
+        return 0
+
+    logs_dir = ROOT / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logpath = logs_dir / f"ingest_audit_{ts}.log"
+
+    rc = 0
+    with open(logpath, "w", encoding="utf-8") as fh:
+        tee     = _Tee(sys.__stdout__, fh)
+        handler = logging.StreamHandler(tee)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        root    = logging.getLogger()
+        prev_level = root.level
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        old_stdout = sys.stdout
+        sys.stdout = tee
+        try:
+            print("\n" + "#" * 72)
+            print(f"# POST-INGEST AUDIT — edition {edition} · {ts}"
+                  f"  (recall={'on' if recall else 'off'}, strict={strict})")
+            print("#" * 72)
+            for source in ("core", "leviathan"):
+                rc |= eval_completeness.run(edition, verbose=False, do_recall=recall,
+                                            strict=strict, source=source)
+            results = [eval_fidelity.audit(source) for source in ("core", "leviathan")]
+
+            print("\n" + "=" * 72)
+            print("AUDIT SUMMARY")
+            for r in results:
+                print(f"  fidelity {r['source']:9}: "
+                      f"accuracy_misses={r['accuracy_misses']}  "
+                      f"review_gaps={r['review_gaps']}  "
+                      f"coverage={r['coverage_pct']:.1f}%")
+                if strict and not r["ok"]:
+                    rc = 1
+            print("=" * 72)
+        finally:
+            sys.stdout = old_stdout
+            root.removeHandler(handler)
+            root.setLevel(prev_level)
+
+    # Refresh the stable "latest" pointer for quick lookup.
+    latest = logs_dir / "last_ingest_audit.log"
+    latest.write_text(logpath.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"  [verify] audit report written to {logpath.relative_to(ROOT)} "
+          f"(and {latest.relative_to(ROOT)})")
+    if strict and rc:
+        print("  [verify] STRICT FAILURE — see REVIEW/MISSING lines above")
+    return rc
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run(reset=False):
-    md_files = sorted(BLOCKS_DIR.glob("*.md"))
+def run(reset=False, edition="10e", verify=True, verify_recall=True, strict_verify=False):
+    ed            = config.get_edition(edition)
+    blocks_dir    = ROOT / ed["blocks_dir"]
+    manifest_path = ROOT / ed["ingest_manifest"]
+
+    md_files = sorted(blocks_dir.glob("*.md"))
     if not md_files:
-        print("[ERROR] No .md files found in data/rule_blocks/. Run etl.py first.",
+        print(f"[ERROR] No .md files found in {ed['blocks_dir']}. Run etl.py first.",
               file=sys.stderr)
         sys.exit(1)
 
-    collection      = get_collection(reset=reset)
-    ingest_manifest = {} if reset else load_ingest_manifest()
+    collection      = get_collection(reset=reset, edition=edition)
+    ingest_manifest = {} if reset else load_ingest_manifest(manifest_path)
     existing        = collection.count()
 
     if reset:
@@ -386,16 +625,22 @@ def run(reset=False):
               f"Checking {len(md_files)} rule blocks for changes...")
 
     p1_up, p1_sk, p2_up, p2_sk, p3_up, p3_sk = ingest_files(
-        collection, md_files, ingest_manifest, reset=reset
+        collection, md_files, ingest_manifest, reset=reset, edition=edition
     )
 
-    save_ingest_manifest(ingest_manifest)
+    save_ingest_manifest(manifest_path, ingest_manifest)
 
     final_count = collection.count()
     total_up    = p1_up + p2_up + p3_up
     total_sk    = p1_sk + p2_sk + p3_sk
     print(f"Ingest complete: {total_up} upserted, {total_sk} skipped. "
           f"Collection now has {final_count} documents.")
+
+    # Post-ingest quality gate: completeness + fidelity audit (logged for audits).
+    if verify:
+        rc = verify_after_ingest(edition, recall=verify_recall, strict=strict_verify)
+        if strict_verify and rc:
+            sys.exit(rc)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -406,5 +651,28 @@ if __name__ == "__main__":
         action="store_true",
         help="Wipe the ChromaDB collection and rebuild from scratch"
     )
+    parser.add_argument(
+        "--edition",
+        default="10e",
+        help="Edition code to ingest (default: 10e)"
+    )
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="skip the post-ingest completeness + fidelity audit"
+    )
+    parser.add_argument(
+        "--verify-no-recall",
+        action="store_true",
+        help="run the audit but skip the slower retrieval (recall) checks"
+    )
+    parser.add_argument(
+        "--strict-verify",
+        action="store_true",
+        help="exit nonzero if the post-ingest audit finds any gap (CI gate)"
+    )
     args = parser.parse_args()
-    run(reset=args.reset)
+    run(reset=args.reset, edition=args.edition,
+        verify=not args.no_verify,
+        verify_recall=not args.verify_no_recall,
+        strict_verify=args.strict_verify)
