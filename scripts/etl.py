@@ -29,18 +29,19 @@ import pandas as pd
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-ROOT       = Path(__file__).resolve().parent.parent   # /home/warhammer/app
-CSV_DIR    = ROOT / "data" / "raw_csv"
-BLOCKS_DIR = ROOT / "data" / "rule_blocks"
-MANIFEST   = BLOCKS_DIR / "manifest.json"
+ROOT = Path(__file__).resolve().parent.parent   # /home/warhammer/app
+sys.path.insert(0, str(ROOT))
+import config
 
-BLOCKS_DIR.mkdir(parents=True, exist_ok=True)
+# Per-edition paths (csv_dir / blocks_dir / scrape_manifest) are resolved inside
+# run() from config.get_edition(edition); nothing path-dependent lives at module
+# scope so the same script serves every edition.
 
 # ── CSV loading ───────────────────────────────────────────────────────────────
 
 READ_OPTS = dict(sep="|", encoding="utf-8-sig", dtype=str)
 
-def load_csvs():
+def load_csvs(csv_dir):
     """Load all Wahapedia CSVs into a dict of DataFrames. Silent on success."""
     files = {
         "datasheets":   "Datasheets.csv",
@@ -59,7 +60,7 @@ def load_csvs():
     }
     dfs = {}
     for key, filename in files.items():
-        path = CSV_DIR / filename
+        path = csv_dir / filename
         if not path.exists():
             print(f"[WARN] Missing CSV: {filename} — skipping", file=sys.stderr)
             dfs[key] = pd.DataFrame()
@@ -74,14 +75,14 @@ def load_csvs():
 
 # ── Manifest helpers ──────────────────────────────────────────────────────────
 
-def load_manifest():
-    if MANIFEST.exists():
-        with open(MANIFEST) as f:
+def load_manifest(manifest_path):
+    if manifest_path.exists():
+        with open(manifest_path) as f:
             return json.load(f)
     return {}
 
-def save_manifest(manifest):
-    with open(MANIFEST, "w") as f:
+def save_manifest(manifest_path, manifest):
+    with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
 def content_hash(text):
@@ -444,9 +445,16 @@ def validate_schema(dfs):
 
 # ── Main ETL run ──────────────────────────────────────────────────────────────
 
-def run(force=False):
+def run(force=False, edition="10e"):
+    # 0. Resolve edition-specific paths
+    ed         = config.get_edition(edition)
+    csv_dir    = ROOT / ed["csv_dir"]
+    blocks_dir = ROOT / ed["blocks_dir"]
+    manifest_path = ROOT / ed["scrape_manifest"]
+    blocks_dir.mkdir(parents=True, exist_ok=True)
+
     # 1. Load CSVs
-    dfs = load_csvs()
+    dfs = load_csvs(csv_dir)
 
     # 2. Validate schema — exit loudly on mismatch
     if not validate_schema(dfs):
@@ -454,7 +462,7 @@ def run(force=False):
         sys.exit(1)
 
     # 3. Load manifest for incremental tracking
-    manifest = {} if force else load_manifest()
+    manifest = {} if force else load_manifest(manifest_path)
 
     # 4. Generate blocks
     written = 0
@@ -468,7 +476,7 @@ def run(force=False):
             continue
         ds_id   = safe(row["id"])
         content = build_unit_block(row, dfs)
-        path    = BLOCKS_DIR / f"unit_{ds_id}.md"
+        path    = blocks_dir / f"unit_{ds_id}.md"
         if write_if_changed(path, content, manifest, force):
             written += 1
         else:
@@ -478,7 +486,7 @@ def run(force=False):
     for _, row in dfs["stratagems"].iterrows():
         strat_id = safe(row["id"])
         content  = build_stratagem_block(row, dfs["factions"])
-        path     = BLOCKS_DIR / f"stratagem_{strat_id}.md"
+        path     = blocks_dir / f"stratagem_{strat_id}.md"
         if write_if_changed(path, content, manifest, force):
             written += 1
         else:
@@ -488,14 +496,14 @@ def run(force=False):
     for _, row in dfs["enhancements"].iterrows():
         enh_id  = safe(row["id"])
         content = build_enhancement_block(row, dfs["factions"])
-        path    = BLOCKS_DIR / f"enhancement_{enh_id}.md"
+        path    = blocks_dir / f"enhancement_{enh_id}.md"
         if write_if_changed(path, content, manifest, force):
             written += 1
         else:
             skipped += 1
 
     # 5. Save manifest
-    save_manifest(manifest)
+    save_manifest(manifest_path, manifest)
 
     print(f"ETL complete: {written} written, {skipped} skipped (unchanged or virtual)")
     return written, skipped
@@ -509,5 +517,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Rewrite all rule-blocks regardless of manifest (full rebuild)"
     )
+    parser.add_argument(
+        "--edition",
+        default="10e",
+        help="Edition code to build (default: 10e)"
+    )
     args = parser.parse_args()
-    run(force=args.force)
+    run(force=args.force, edition=args.edition)
