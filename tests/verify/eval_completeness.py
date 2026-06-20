@@ -22,10 +22,10 @@ chunk containing it. Because the fingerprint comes from the source (not from our
 own chunks), a miss is a real dropped-content / ranking bug, not a tautology.
 
 Run:
-  python tests/eval_completeness.py             # full report
-  python tests/eval_completeness.py -v          # also list every PASS
-  python tests/eval_completeness.py --strict     # exit nonzero if any rule missing
-  python tests/eval_completeness.py --no-recall  # ingest check only (fast)
+  python tests/verify/eval_completeness.py             # full report
+  python tests/verify/eval_completeness.py -v          # also list every PASS
+  python tests/verify/eval_completeness.py --strict     # exit nonzero if any rule missing
+  python tests/verify/eval_completeness.py --no-recall  # ingest check only (fast)
 
 This is offline: it reads the cached HTML + on-disk .md corpus and drives app.py
 assembly headless. No network, no Wahapedia fetch.
@@ -43,7 +43,7 @@ logging.getLogger("streamlit").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))        # for eval_retrieval
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent)) # for app / config
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent)) # for app / config
 
 from eval_retrieval import final_context  # noqa: E402  (reuses the real assembly path)
 import app     # noqa: E402

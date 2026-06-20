@@ -31,3 +31,6 @@ Thumbs.db
 
 # Spec
 spec/
+
+# Build artifact - might be able to drop later
+data/dep_graph_10e.draft.json

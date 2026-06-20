@@ -15,9 +15,9 @@ retrieve_rules_slice → assemble_context → inject_sequence_neighbors), so it
 measures what would actually reach the model — no reimplementation of ranking.
 
 Run:
-  python tests/eval_retrieval.py            # 10e, all cases
-  python tests/eval_retrieval.py -v         # also print the final chunk list
-  python tests/eval_retrieval.py --edition 10e
+  python tests/verify/eval_retrieval.py            # 10e, all cases
+  python tests/verify/eval_retrieval.py -v         # also print the final chunk list
+  python tests/verify/eval_retrieval.py --edition 10e
 
 Exit code is non-zero if any case fails — usable as a CI / pre-Layer-3 gate.
 
@@ -38,7 +38,7 @@ from pathlib import Path
 logging.getLogger("streamlit").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import app  # noqa: E402  (after path insert)
 import config  # noqa: E402
 
@@ -54,11 +54,20 @@ def final_context(query: str, edition: str, mp_mode: bool) -> list[dict]:
     intentionally skipped here.
     """
     expanded, where, _ = app.process_query(query, edition, mission_pack_mode=mp_mode)
-    raw   = app.retrieve(expanded, where, edition, n_results=config.TOP_K * 3)
+    raw   = app.retrieve(expanded, where, edition, n_results=config.RERANK_CANDIDATES)
     rules = app.retrieve_rules_slice(
         expanded, edition, mission_pack_mode=mp_mode,
         n_results=config.TOP_K_RULES * 2,
     )
+    # Layer 3 — mirror render_chat: seed the rules a surfaced chunk depends on
+    # (definitions + referenced rules), rerank the pool, parent-cap the seeded deps,
+    # then assemble caps at TOP_K / budget.
+    rerank_query = expanded if config.RERANK_USE_EXPANDED else query
+    pool = raw + rules
+    raw  = raw + app.seed_definitions(rerank_query, pool, edition, mp_mode) \
+               + app.seed_referenced_rules(rerank_query, pool, edition, mp_mode)
+    app.rerank_pools(rerank_query, edition, mp_mode, raw, rules)
+    app.rank_seeded_below_parents(raw + rules, edition, mp_mode)
     chunks = app.assemble_context(raw, rules, edition, mission_pack_mode=mp_mode)
     return app.inject_sequence_neighbors(chunks, edition)
 

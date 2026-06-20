@@ -25,9 +25,9 @@ legitimate transforms never register as infidelity and the audit can't drift out
 of sync with the scraper.
 
 Run:
-  python tests/eval_fidelity.py                  # core + leviathan report
-  python tests/eval_fidelity.py --source core
-  python tests/eval_fidelity.py --strict         # exit nonzero on any REVIEW gap
+  python tests/verify/eval_fidelity.py                  # core + leviathan report
+  python tests/verify/eval_fidelity.py --source core
+  python tests/verify/eval_fidelity.py --strict         # exit nonzero on any REVIEW gap
                                                  # or any accuracy miss
 
 Offline: reads cached HTML + the on-disk .md corpus. No network, no model.
@@ -40,7 +40,7 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
 import scrape_rules as sr  # noqa: E402  (transforms + is_skipped_slug, kept in sync)
 from bs4 import BeautifulSoup, NavigableString, Tag  # noqa: E402
 

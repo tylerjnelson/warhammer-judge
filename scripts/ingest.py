@@ -535,7 +535,7 @@ def verify_after_ingest(edition="10e", recall=True, strict=False):
     gate fails. Audit failures never corrupt the ingest itself — the collection is
     already written by the time this runs.
     """
-    tests_dir = ROOT / "tests"
+    tests_dir = ROOT / "tests" / "verify"
     sys.path.insert(0, str(tests_dir))
     try:
         import eval_completeness
