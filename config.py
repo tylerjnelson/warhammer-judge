@@ -52,21 +52,61 @@ LLM_API_KEY  = os.getenv("GROQ_API_KEY")
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 
-TOP_K              = 8       # chunks retrieved per query
+TOP_K              = 8       # TARGET chunk count — kept lean on purpose so a multi-turn
+                             # exchange leaves TPM headroom. A soft target, NOT a hard
+                             # cap: the per-category reservations below may push past it;
+                             # the only HARD ceiling is RULES_CONTEXT_TOKEN_BUDGET (2800).
 TOP_K_RULES        = 4       # guaranteed slots reserved for Core_Rules / mission-pack
-SIMILARITY_THRESHOLD = 0.35  # discard chunks below this cosine similarity
+# ── Named-unit reservation (per unit, not global) ─────────────────────────────
+# Reserved by metadata (retrieve_unit_slice), so a unit that doesn't embed near the
+# query (Abaddon vs 'Devastating Wounds') still reaches context. PER-UNIT so one named
+# unit can't sweep the slots from another in a 2-unit question.
+UNIT_CHUNKS_PER_UNIT = 2     # cap of reserved chunks per NAMED unit
+UNIT_SECOND_RATIO    = 0.3   # keep a unit's 2nd chunk only if its rerank score is within
+                             # this ratio of the unit's OWN best chunk. Relative, not
+                             # absolute: the cross-encoder rates a unit's stat-block ~0
+                             # for a generic ability question, so an absolute floor would
+                             # drop the name-bearing chunk. "2nd is legitimately
+                             # irrelevant" = far weaker than this unit's best (Abaddon
+                             # Datasheet 0.845 vs Keywords 0.037 → drop; Aberrants 0.0002
+                             # vs 0.0001 → reranker indifferent → keep).
+UNIT_SECOND_FLOOR    = 0.1   # ...but ONLY apply that ratio when the unit's best chunk is
+                             # itself meaningfully relevant (≥ this). Below it the reranker
+                             # can't tell the unit's chunks apart, so the ratio amplifies
+                             # noise into a spurious drop — keep both (Snikrot top 0.027:
+                             # ratio would drop his datasheet 0.004, losing the proof he
+                             # has Infiltrators). 0.845 Abaddon stays above → ratio holds.
+REST_GATE            = 0.0   # rerank floor for DISCRETIONARY (non-reserved) fill chunks,
+                             # so spare budget isn't packed with low-relevance noise.
+                             # Tunable; 0.0 = current behavior (off).
+SIMILARITY_THRESHOLD = 0.3   # discard chunks below this cosine similarity (lowered
+                             # 0.35→0.3 to widen the candidate pool the reranker sorts)
 
-# Completion cap. Counts against the 6K/min TPM ceiling (and, for the reasoning
-# model, includes <think> tokens we later strip). See the rate-limit block above
-# and spec/retrieval.md for how this fits the per-call token budget.
-MAX_OUTPUT_TOKENS  = 1000
+# Completion cap (passed as max_completion_tokens). Counts against the 6K/min TPM
+# ceiling AND includes the reasoning model's <think> tokens (billed even though we
+# strip them before display). Measured: a complex adjudication completes naturally at
+# ~1.3-1.4K completion tokens; at 1000 it truncated mid-<think> (finish_reason=length),
+# returning a cut-off trace with no ruling. 2048 gives headroom so answers finish
+# (finish_reason=stop). Input (≈2800-tok rules context) still dominates TPM, so this
+# headroom adds little per-call cost. See the rate-limit block above.
+MAX_OUTPUT_TOKENS  = 2048
 
 # ── Per-call token budget (Layer 2) ───────────────────────────────────────────
 # The real cap on what reaches the model is a TOKEN budget, not a chunk count
 # (TOP_K only bounds candidates). Sized so a multi-turn exchange fits 2-3 calls
-# inside the 6K/min TPM window. The allocator fills RULES_CONTEXT_TOKEN_BUDGET
-# with retrieved chunks (rules first), truncating only at line boundaries.
-RULES_CONTEXT_TOKEN_BUDGET = 2800   # tokens of retrieved rule context per call
+# inside the 6K/min TPM window.
+#
+# OVERFLOW BEHAVIOR (2026-06-20): this is a SOFT target, not a hard cut. format_rules_
+# context adds WHOLE chunks (rules first) and never truncates a rule mid-text — the
+# chunk that crosses the budget is included in full, then assembly stops. So a rule is
+# never reduced to a misleading header (which caused the model to mis-cite / refuse).
+# Consequence: the actual context overruns the budget by up to one chunk. Most chunks
+# are ~300 tokens, but a few core-rule/datasheet chunks run 600-900, so the MEASURED
+# worst case across the 35-question eval is ~3667 tokens (vs the 2800 target). This is
+# accepted: 3.7K input + ~1.3K output still fits the 6K/min TPM ceiling per call. If
+# the overrun ever needs bounding, cap the boundary-chunk SIZE (drop it whole, never
+# slice) rather than reinstating mid-chunk truncation.
+RULES_CONTEXT_TOKEN_BUDGET = 2800   # SOFT per-call target (see overflow behavior above)
 MAX_HISTORY_MESSAGES       = 6      # prior turns re-sent each call — trim proactively
 TOKEN_CHAR_RATIO           = 4      # ~chars per token, cheap budget estimate
 
@@ -92,13 +132,58 @@ RULES_SEQUENCES = {
     "11e": {},
 }
 
-# Post-retrieval authority boosts, added to cosine similarity at merge time so
-# rules break ties against longer datasheet chunks, and mission-pack outranks
-# Core Rules when the mission-pack toggle is ON. See spec/retrieval.md (Layer 1).
-# The mission-pack boost is only applied when the toggle is on; when off,
-# mission-pack chunks are never retrieved at all (HARD INVARIANT).
-RULES_BOOST_MISSION_PACK = 0.15
-RULES_BOOST_CORE         = 0.10
+# Post-retrieval authority TIEBREAK (see spec/reranker.md §8e). The old flat
+# additive boosts (+0.15/+0.10) were RETIRED: they were tuned for the cosine band
+# but misbehave under reranking, where relevant chunks bunch at 0.95–0.999 — a 0.05
+# flat differential there leapfrogs a *more*-relevant chunk (it let Leviathan mission
+# cards sweep the Core objective rule). Rules now surface as CONTEXT by being
+# *referenced* (seed_referenced_rules), not by a blanket boost, so authority is just
+# a tiny tiebreak that orders genuine ties (mission-pack > Core) without overpowering
+# relevance. Mission-pack only applies when the toggle is on; when off, mission-pack
+# chunks are never retrieved at all (HARD INVARIANT — where-filter).
+AUTHORITY_TIEBREAK       = 0.001   # mission-pack gets 2×, Core 1× — ties only
+
+# ── Dependency seeding params (used by the LIVE seed_definitions/seed_referenced_rules
+#    path via rank_seeded_below_parents + _gate_and_build). The old HYBRID_DEP_BOOST
+#    flag + inject_dependency_boosts() it gated were removed 2026-06-20 (superseded by
+#    seed_definitions span-bridge seeding). These knobs remain live.
+# Protective margin a seeded dependency sits BELOW the weakest parent that sourced
+# it (rank_seeded_below_parents). Keeps a dep riding just under its parent — close
+# enough to win leftover budget, never able to out-rank it. Larger = more conservative.
+RULES_BOOST_DEP         = 0.02
+DEP_BOOST_MAX_PER_QUERY = 5      # cap seeded deps per query (drop lowest-scoring extras)
+DEP_SCORE_EPS           = 0.001  # tiny ladder step so multiple deps order deterministically
+# Per-edition ratified dependency-graph artifact (stem -> [dep_stem, ...]). Loaded
+# lazily; absent file ⇒ the feature simply no-ops. Hand-ratified, frozen once green.
+RULES_DEP_GRAPH_PATH    = "data/dep_graph_{edition}.json"
+
+# ── Cross-encoder reranking (Layer 3, ranking half) ───────────────────────────
+# Bi-encoder cosine rewards keyword density over conceptual centrality (measured:
+# "how do normal moves work" filled the budget with aircraft/flying edge chunks
+# that repeat "Normal move", dropping the core constraints engagement_range /
+# unit_coherency). A cross-encoder scores (query, passage) JOINTLY and reorders the
+# candidate pool before assemble_context's TOP_K cap. Local model ⇒ ZERO Groq TPM
+# (unlike an LLM reranker, which would spend the scarce 6K/min budget every turn).
+# Always on (shipped 2026-06-19, no toggle). Full design: spec/reranker.md.
+# Prod IS the no-AVX2 / no-GPU box, so the 2-layer model is FIXED — the 6-layer
+# L-6 is unusable here (~20 s at 48 candidates). Do NOT swap to L-6 on this host.
+RERANK_MODEL        = "cross-encoder/ms-marco-TinyBERT-L2-v2"  # ~26 ms/candidate on prod CPU
+RERANK_CANDIDATES   = 48      # first-stage pool the reranker sorts (N=48 ≈ 1.25 s, accepted)
+RERANK_USE_EXPANDED = False   # rerank against the RAW user query, not the synonym-expanded one
+
+# Span-bridge gate for seeded child definitions (spec/reranker.md §8d). A dependency
+# (engagement_range) reads as IRRELEVANT to the query by similarity, so we never
+# compare them directly. Instead we find the sentence INSIDE the parent rule that
+# names the dep ("...no model can move within Engagement Range...") and seed the dep
+# only when the QUERY is similar to THAT sentence — i.e. the question is about the
+# part of the rule that needs the dep. Gate = max cosine(query, naming-sentence).
+SPAN_GATE_MIN       = 0.45    # bridging-sentence cosine floor to seed a dep (probe: keep≈0.52, drop≈0.34)
+# For ability→rule context (seed_referenced_rules) the span-bridge is the WRONG gate:
+# a unit question ("how does this ability work") isn't phrased like the rule mechanic,
+# so query↔naming-sentence is low even when the rule IS needed context. The right
+# signal is the PARENT ability's own relevance — if the ability surfaced strongly, the
+# rule it grants is context. Gate on the ability's cosine relevance instead.
+REFERENCED_PARENT_MIN = 0.45  # min parent (unit/ability) relevance to seed the rules it names
 
 # ── Lexical (BM25) hybrid retrieval (Layer 3, lexical half) ───────────────────
 # Dense MiniLM misses exact rule-name lookups for sub-rules diluted inside a

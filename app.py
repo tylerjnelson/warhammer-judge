@@ -8,6 +8,7 @@ Run:
 """
 
 import json
+import math
 import sqlite3
 import re
 import hashlib
@@ -341,6 +342,15 @@ _UNIT_STOPWORDS = {
     "with", "and", "the", "of", "in", "on",
 }
 
+def _light_stem(t: str) -> str:
+    """Strip a common inflectional suffix so 'burning'/'burned'/'burns' all reduce to
+    'burn'. Deliberately crude (no linguistic stemmer dependency) — used only to match
+    a query token against the rules-corpus vocabulary for unit-signal rejection."""
+    for suf in ("ing", "ed", "es", "s"):
+        if len(t) - len(suf) >= 3 and t.endswith(suf):
+            return t[: -len(suf)]
+    return t
+
 @st.cache_resource
 def build_unit_index(edition: str):
     """Distinctive unit-name lookup for query routing (NOT retrieval scoping).
@@ -385,11 +395,34 @@ def build_unit_index(edition: str):
     # (battle=24, charge=12, strike=7) recurs widely. 3 cleanly splits them.
     core_vocab = {t for t, n in core_df.items() if n >= 3}
 
-    # Distinctive = long enough, not generic role vocab, not core-rules language,
-    # and not spread across a huge number of datasheets.
+    # Mission-pack vocabulary: words that are MISSION language, not unit signals —
+    # 'leviathan' (the pack name) sits only in the datasheet 'Leviathan Dreadnought',
+    # 'burning' only in 'Burning Chariot', so without this they'd misfire a unit lookup
+    # / unit slice on a pure mission question ("how does BURNING an objective score").
+    # Any token in ≥1 mission-pack block (these blocks are far fewer than core) plus the
+    # pack name itself is subtracted.
+    mp_name  = config.get_edition(edition)["mission_pack"]["name"].lower()
+    mp_vocab = set(re.findall(r"[a-z0-9]+", mp_name))
+    mp_glob  = str((ROOT / "data" / "rule_blocks" / edition / f"{mp_name}_*.md"))
+    for path in glob.glob(mp_glob):
+        with open(path, encoding="utf-8") as f:
+            mp_vocab |= set(re.findall(r"[a-z0-9]+", f.read().lower()))
+
+    # Stem the MISSION-PACK vocab only, so a morphological variant in the query is still
+    # recognised as mission language: the block says "burned", the query says "burning"
+    # — both stem to "burn", so "burning" (→ datasheet "Burning Chariot") is rejected as
+    # a unit signal. NOT applied to core_vocab: its ≥3-block threshold is tuned to keep
+    # unit-type words like "terminator" (whose plural "terminators" sits in core
+    # examples) AS unit signals — stemming core would wrongly drop them.
+    mp_stems = {_light_stem(t) for t in mp_vocab}
+
+    # Distinctive = long enough, not generic role vocab, not core-rules language, not
+    # mission-pack language (literal or stemmed), not spread across many datasheets.
     tokens = {
         t for t, n in token_df.items()
-        if len(t) >= 5 and t not in _UNIT_STOPWORDS and t not in core_vocab and n <= 40
+        if len(t) >= 5 and t not in _UNIT_STOPWORDS
+        and t not in core_vocab and t not in mp_vocab
+        and _light_stem(t) not in mp_stems and n <= 40
     }
     return phrases, tokens
 
@@ -402,6 +435,101 @@ def detect_unit(query: str, edition: str) -> bool:
     if q_tokens & tokens:
         return True
     return any(p in q for p in phrases)
+
+# ── Unit-name resolution + sequential clarification (unit slice / disambiguation) ─
+# detect_unit answers "is this a unit lookup?" (a bool, for routing). The functions
+# below answer "WHICH datasheet(s)?" — needed to (a) source the unit's own chunks
+# (retrieve_unit_slice) and (b) drive faction disambiguation BEFORE the heavy
+# retrieval/rerank, deterministically from metadata rather than from whatever
+# surfaced semantically (so a unit that doesn't embed near the query is still caught).
+
+@st.cache_resource
+def get_unit_name_resolver(edition: str):
+    """Map a query to the specific datasheet name(s) it mentions. Returns
+    (names, token_to_name):
+      • names — datasheet names, LONGEST first, so substring matching prefers the
+                most specific variant ('Land Raider Crusader' before 'Land Raider');
+      • token_to_name — distinctive single tokens that resolve to exactly ONE
+                datasheet ('snikrot'→'Boss Snikrot'). Tokens shared by several
+                datasheets ('raider') are omitted — they need a full-name phrase or
+                clarification, never a guess.
+    Distinctiveness is reused from build_unit_index (stopwords + core-vocab stripped)."""
+    import pandas as pd
+    _, tokens = build_unit_index(edition)
+    csv_path  = ROOT / config.get_edition(edition)["csv_dir"] / "Datasheets.csv"
+    names = []
+    if csv_path.exists():
+        df = pd.read_csv(csv_path, sep="|", encoding="utf-8-sig", dtype=str)
+        names = sorted({str(n).strip() for n in df["name"].dropna() if str(n).strip()},
+                       key=len, reverse=True)
+    tok2names = defaultdict(set)
+    for nm in names:
+        for t in set(re.findall(r"[a-z0-9]+", nm.lower())):
+            if t in tokens:
+                tok2names[t].add(nm)
+    token_to_name = {t: next(iter(ns)) for t, ns in tok2names.items() if len(ns) == 1}
+    return names, token_to_name
+
+def resolve_named_units(query: str, edition: str) -> list[str]:
+    """The specific datasheet name(s) a query mentions. Full-name substring match
+    plus distinctive-single-token fallback; keeps only the most specific name when
+    one matched name is a substring of another ('Land Raider' dropped when 'Land
+    Raider Crusader' also matched)."""
+    names, token_to_name = get_unit_name_resolver(edition)
+    q = query.lower()
+    found = {nm for nm in names if nm.lower() in q}
+    for t in set(re.findall(r"[a-z0-9]+", q)) & token_to_name.keys():
+        found.add(token_to_name[t])
+    return sorted(n for n in found
+                  if not any(n != m and n.lower() in m.lower() for m in found))
+
+def unit_armies(unit_name: str, edition: str) -> list[str]:
+    """Distinct armies a datasheet name appears under — the faction-ambiguity axis."""
+    collection = get_collection(edition)
+    try:
+        res = collection.get(where={"unit_name": unit_name}, include=["metadatas"])
+    except Exception:
+        return []
+    return sorted({m.get("army") for m in res["metadatas"] if m.get("army")})
+
+def clarification_options(unit_name: str, edition: str) -> list[tuple]:
+    """(label, unit_name, army) choices for one multi-faction unit."""
+    return [(f"{unit_name} ({a})", unit_name, a) for a in unit_armies(unit_name, edition)]
+
+def build_clarification_queue(query: str, edition: str,
+                              selected_faction: str | None = None) -> dict | None:
+    """Sequential disambiguation state for every multi-faction unit the query names
+    while no faction is pinned. Returns the pending-clarification dict, or None if
+    nothing needs disambiguating. Runs BEFORE retrieval/rerank so the heavy work only
+    happens once the faction(s) are known.
+
+      {"query", "queue": [unit, ...], "resolved": {unit: army}, "options": {unit: [...]}}
+    """
+    _, factions = build_faction_keyword_map(edition)
+    if (selected_faction and selected_faction != "All Factions") \
+            or detect_faction(query, factions):
+        return None  # faction pinned (sidebar or query) → resolve without asking
+    queue, options = [], {}
+    for u in resolve_named_units(query, edition):
+        if len(unit_armies(u, edition)) > 1:
+            queue.append(u)
+            options[u] = clarification_options(u, edition)
+    if not queue:
+        return None
+    return {"query": query, "queue": queue, "resolved": {}, "options": options}
+
+def next_clarification(state: dict | None) -> tuple | None:
+    """(unit_name, options) for the next unresolved unit, or None when the queue is done."""
+    if not state or not state.get("queue"):
+        return None
+    u = state["queue"][0]
+    return u, state["options"][u]
+
+def apply_clarification(state: dict, unit_name: str, army: str) -> dict:
+    """Record a faction pick and advance the queue (returns a NEW state dict)."""
+    resolved = {**state["resolved"], unit_name: army}
+    queue    = [u for u in state["queue"] if u != unit_name]
+    return {**state, "resolved": resolved, "queue": queue}
 
 def expand_query(query: str) -> str:
     q = query
@@ -569,119 +697,390 @@ def retrieve_rules_slice(query: str, edition: str, mission_pack_mode: bool,
     # mission-pack chunk can never leak in while the toggle is off.
     return [c for c in chunks if c["metadata"].get("category") in allowed]
 
-def boosted_score(chunk: dict, edition: str, mission_pack_mode: bool) -> float:
-    """Cosine similarity plus an authority boost (mission-pack > core > rest)."""
-    cat         = chunk["metadata"].get("category", "")
+# ── Guaranteed unit slice (datasheet candidacy for unit-named queries) ─────────
+
+UNIT_SLICE_CATEGORIES = ("Datasheet", "Ability", "Datasheet_Section")
+
+def retrieve_unit_slice(query: str, edition: str, mission_pack_mode: bool,
+                        resolution: dict | None = None) -> list[dict]:
+    """Guaranteed candidacy for the datasheet(s) a query NAMES: a metadata fetch
+    (NOT semantic) of each named unit's own chunks. A unit that doesn't embed near
+    the query — Abaddon's stat block vs a 'Devastating Wounds' question — is still
+    placed in the pool, where the reranker scores it and assemble_context reserves
+    the best per-unit chunks into context (without forcing them to rank 1).
+
+    Cross-faction (Land Raider ×N) is bounded three ways: the army is pinned to the
+    resolved faction (clarification / faction named in query / sole army); content_key
+    dedup collapses identical text; the reserved-slot cap stops a flood. When a unit
+    is multi-faction and STILL unresolved (e.g. user dismissed clarification), all
+    armies are fetched but dedup + cap keep it bounded.
+
+    similarity defaults to 0.0 (not None) so degraded cosine mode — reranker failed
+    to load — still sorts these without a crash; they just rank low but stay present.
+    """
+    resolution  = resolution or {}
+    _, factions = build_faction_keyword_map(edition)
+    q_faction   = detect_faction(query, factions)
+    collection  = get_collection(edition)
+    cats        = {"$in": list(UNIT_SLICE_CATEGORIES)}
+    out = []
+    for unit in resolve_named_units(query, edition):
+        armies = unit_armies(unit, edition)
+        army   = resolution.get(unit) or q_faction or (armies[0] if len(armies) == 1 else None)
+        where  = ({"$and": [{"unit_name": unit}, {"army": army}, {"category": cats}]}
+                  if army else {"$and": [{"unit_name": unit}, {"category": cats}]})
+        try:
+            res = collection.get(where=where, include=["documents", "metadatas"])
+        except Exception:
+            continue
+        for doc, meta in zip(res["documents"], res["metadatas"]):
+            out.append({"text": doc, "metadata": meta, "similarity": 0.0, "unit_seed": True})
+    return out
+
+def authority_boost(meta: dict, edition: str, mission_pack_mode: bool) -> float:
+    """Authority TIEBREAK (mission-pack > core > rest). Tiny by design: it only
+    orders genuine ties without overpowering relevance. The old flat cosine-band
+    boosts were retired — they leapfrogged more-relevant chunks in the compressed
+    rerank band, and rules now surface as context by being *referenced*
+    (seed_referenced_rules), not boosted. See spec/reranker.md §8e."""
+    cat         = meta.get("category", "")
     mp_category = config.get_edition(edition)["mission_pack"]["category"]
-    score       = chunk["similarity"]
     if mission_pack_mode and cat == mp_category:
-        return score + config.RULES_BOOST_MISSION_PACK
+        return 2 * config.AUTHORITY_TIEBREAK
     if cat == "Core_Rules":
-        return score + config.RULES_BOOST_CORE
-    return score
+        return config.AUTHORITY_TIEBREAK
+    return 0.0
+
+def boosted_score(chunk: dict, edition: str, mission_pack_mode: bool) -> float:
+    """Relevance plus the authority tiebreak (mission-pack > core > rest).
+
+    Relevance is the cross-encoder score (chunk['rerank'], 0..1) when the chunk was
+    reranked; the bi-encoder cosine otherwise (e.g. a chunk that bypassed the
+    reranker). The authority tiebreak stays deterministic — it encodes the
+    mission-pack-overrides-core ordering, never delegated to a learned model.
+    """
+    relevance = chunk["rerank"] if "rerank" in chunk else chunk["similarity"]
+    return relevance + authority_boost(chunk["metadata"], edition, mission_pack_mode)
+
+# ── Cross-encoder reranking (Layer 3, ranking half) ───────────────────────────
+
+@st.cache_resource
+def get_reranker():
+    """Load the cross-encoder once (mirrors get_collection). Local ⇒ zero Groq TPM.
+    Returns None on any load failure so the chat path degrades to cosine ranking
+    rather than crashing. See spec/reranker.md."""
+    try:
+        from sentence_transformers import CrossEncoder
+        return CrossEncoder(config.RERANK_MODEL)
+    except Exception:
+        return None
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def rerank_pools(query: str, edition: str, mission_pack_mode: bool, *pools: list) -> None:
+    """Stamp chunk['rerank'] = sigmoid(cross-encoder logit) on every UNIQUE chunk
+    across the given candidate pools, scoring each once (deduped by content_key).
+
+    No-op when the model fails to load or there are no candidates — callers fall
+    back to cosine via boosted_score. Operates only on already-where-filtered
+    candidates, so the mission-pack HARD INVARIANT holds by construction (a chunk
+    that was never retrieved can't be reranked in). Mutates the chunk dicts in
+    place; does not reorder (assemble_context sorts).
+    """
+    model = get_reranker()
+    if model is None:
+        return
+    unique = {}
+    for pool in pools:
+        for c in pool:
+            unique.setdefault(content_key(c), c)
+    if not unique:
+        return
+    items  = list(unique.values())
+    logits = model.predict([(query, c["text"]) for c in items])
+    score_by_key = {k: _sigmoid(float(s)) for k, s in zip(unique.keys(), logits)}
+    for pool in pools:
+        for c in pool:
+            c["rerank"] = score_by_key[content_key(c)]
+
+
+@st.cache_resource
+def get_embedder():
+    """The bi-encoder used for the span-bridge gate (same model the collection
+    embeds with). Loaded once; reused for cheap sentence/query encodings."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(config.EMBEDDING_MODEL)
+
+
+# Surface forms used to locate the sentence in a parent rule that NAMES a dep.
+# Curated for the ratified graph's deps; falls back to the stem's words otherwise.
+_DEP_SURFACE = {
+    "normal_moves":         r"normal move",
+    "advance_moves":        r"\badvanc",          # "Advance", "Advanced", "Advancing"
+    "fall_back_moves":      r"f(?:all|ell) back",
+    "remain_stationary":    r"remain(?:s|ed|ing)? stationary",
+    "engagement_range":     r"engagement range",
+    "unit_coherency":       r"coherency",
+    "charging_with_a_unit": r"charge move|charging",
+}
+
+def _dep_surface_re(dep_stem: str):
+    pat = _DEP_SURFACE.get(dep_stem) or re.escape(
+        re.sub(r"^\d+\s+", "", dep_stem.replace("_", " ")).rstrip("s"))
+    return re.compile(pat, re.I)
+
+def _rule_sentences(text: str) -> list[str]:
+    """Split a rule chunk into sentences (rules prose only, minus header lines)."""
+    prose = "\n".join(l for l in text.splitlines()
+                      if not l.startswith("#") and not l.startswith("**"))
+    return [s.strip() for s in re.split(r"(?<=[.])\s+", prose) if len(s.strip()) > 15]
+
+def _cos(a, b) -> float:
+    denom = (float(a @ a) ** 0.5) * (float(b @ b) ** 0.5)
+    return float(a @ b) / denom if denom else 0.0
+
+_CHUNK_SENT_CACHE: dict = {}   # content_key -> (sentences, embeddings)
+
+def _chunk_sentence_embeddings(chunk: dict):
+    """Sentences of a chunk + their embeddings, cached by content_key. Works for any
+    parent (a rule chunk for definitions, a unit/ability chunk for referenced rules)."""
+    key = content_key(chunk)
+    cached = _CHUNK_SENT_CACHE.get(key)
+    if cached is None:
+        sents = _rule_sentences(chunk["text"])
+        embs  = get_embedder().encode(sents) if sents else []
+        cached = (sents, embs)
+        _CHUNK_SENT_CACHE[key] = cached
+    return cached
+
+
+# USRs that unit/ability chunks reference by name, as they appear in ability text
+# (surface regex) -> a substring to resolve the actual rule chunk. Curated, high
+# precision; extend as needed. Replaces the blanket authority boost for unit Qs.
+_USR_RULES = {
+    r"\bfall(?:s|ing)? back\b|\bfell back\b":  "fall back",
+    r"\bdeep strike\b":                        "deep strike",
+    r"\bfeel no pain\b":                       "feel no pain",
+    r"\blone operative\b":                     "lone operative",
+    r"\bengagement range\b":                   "engagement range",
+    r"\bbattle.?shock(?:ed)?\b":               "battle shock",
+    r"\bdeadly demise\b":                      "deadly demise",
+    r"\bfights? first\b":                      "fights first",
+    r"\bstealth\b":                            "stealth",
+    r"\bprecision\b":                          "precision",
+    r"\bscouts?\b":                            "scouts",
+    r"\binfiltrators?\b":                      "infiltrators",
+    r"\bbig guns never tire\b":                "big guns never tire",
+    r"\bdevastating wounds\b":                 "devastating wounds",
+    r"\bsustained hits\b":                     "sustained hits",
+    r"\blethal hits\b":                        "lethal hits",
+}
+
+@st.cache_resource
+def get_rule_name_index(edition: str):
+    """[(surface_regex, rule_stem), …] for the USRs unit abilities reference by name.
+    Resolves each curated keyword to a real rule chunk via the rule vocabulary, so a
+    surfaced ability that names a USR can seed that rule as context."""
+    _, seed = get_dep_index(edition)
+    index = []
+    for rx, key in _USR_RULES.items():
+        stem = next((s for s, p in seed.items()
+                     if key in rule_display_name(p["metadata"])), None)
+        if stem:
+            index.append((re.compile(rx, re.I), stem))
+    return index
+
+
+def _gate_and_build(dep_parents: dict, dep_bridge: dict, seed: dict,
+                    allowed: set, present: set, gate: float) -> list:
+    """Apply the relevance gate and build seed chunks (shared by both seeders).
+    `dep_bridge` is the per-dep relevance signal — the span-bridge sentence score
+    for definitions, the parent ability's relevance for referenced rules — and a dep
+    is seeded only when it clears `gate`. Records sourcing parents (by content_key)
+    + score so rank_seeded_below_parents can ride each dep just below its parent.
+    Strongest first; bounded by DEP_BOOST_MAX_PER_QUERY."""
+    out = []
+    for d in sorted(dep_parents, key=lambda k: dep_bridge.get(k, -1.0), reverse=True):
+        if dep_bridge.get(d, -1.0) < gate:
+            continue
+        payload = seed.get(d)
+        if payload is None or payload["metadata"].get("category") not in allowed:
+            continue
+        cand = {"text": payload["text"], "metadata": payload["metadata"],
+                "similarity": 0.0, "dep_seed": True,
+                "dep_parent_keys": sorted(dep_parents[d]),
+                "dep_bridge": round(dep_bridge[d], 3)}
+        if content_key(cand) in present:                    # already retrieved
+            continue
+        present.add(content_key(cand))
+        out.append(cand)
+        if len(out) >= config.DEP_BOOST_MAX_PER_QUERY:      # bound blast radius
+            break
+    return out
+
+
+def seed_definitions(query: str, pool: list, edition: str, mission_pack_mode: bool) -> list:
+    """Seed child-definition chunks a surfaced parent RULE references but doesn't
+    contain (charge_phase → engagement_range, unit_coherency), from the ratified dep
+    graph — SPAN-BRIDGE gated so only deps the *question* needs enter the pool.
+
+    The span bridge: a dep reads as irrelevant to the query by direct similarity, so
+    we never compare them. For each active parent we find the sentence(s) that NAME
+    the dep and score the QUERY against them; the dep is seeded only when that bridge
+    score ≥ SPAN_GATE_MIN — i.e. the question is about the part of the rule that
+    invokes the dep. Depth-1; mission-pack filtered (HARD INVARIANT). See §8d."""
+    graph = get_dep_graph(edition)
+    if not graph:
+        return []
+    bc_to_stem, seed = get_dep_index(edition)
+    allowed = _dep_boost_cats(edition, mission_pack_mode)
+    present = {content_key(c) for c in pool}
+    qv = get_embedder().encode([query])[0]
+
+    dep_parents: dict = {}   # dep_stem -> set(parent content_key)
+    dep_bridge:  dict = {}   # dep_stem -> best cos(query, naming-sentence)
+    for c in pool:
+        if c["metadata"].get("category") not in allowed:
+            continue
+        if boosted_score(c, edition, mission_pack_mode) < config.SIMILARITY_THRESHOLD:
+            continue
+        pstem = bc_to_stem.get(c["metadata"].get("breadcrumb"))
+        if pstem not in graph:
+            continue
+        sents, embs = _chunk_sentence_embeddings(c)
+        for d in graph[pstem]:
+            dep_parents.setdefault(d, set()).add(content_key(c))
+            pat    = _dep_surface_re(d)
+            naming = [e for s, e in zip(sents, embs) if pat.search(s)]
+            if naming:
+                dep_bridge[d] = max(dep_bridge.get(d, -1.0), max(_cos(qv, e) for e in naming))
+    return _gate_and_build(dep_parents, dep_bridge, seed, allowed, present, config.SPAN_GATE_MIN)
+
+
+def seed_referenced_rules(query: str, pool: list, edition: str, mission_pack_mode: bool) -> list:
+    """Seed core/Leviathan rule chunks that surfaced UNIT/ABILITY chunks reference BY
+    NAME, as the rules context needed to understand those abilities (and unit-vs-unit
+    interactions). Parent = a surfaced non-rule chunk; dep = the USR it names.
+
+    Gated on the PARENT ability's relevance (≥ REFERENCED_PARENT_MIN), not a span-
+    bridge: a unit question isn't phrased like the rule mechanic, so the rule surfaces
+    because the *ability* that grants it is relevant. Name-match is presence-based (no
+    sentence embedding needed). Capped below the parent by rank_seeded_below_parents.
+    The principled replacement for the blanket authority boost on unit Qs. See §8e."""
+    index = get_rule_name_index(edition)
+    if not index:
+        return []
+    _, seed  = get_dep_index(edition)
+    allowed  = _dep_boost_cats(edition, mission_pack_mode)
+    mp_cat   = config.get_edition(edition)["mission_pack"]["category"]
+    present  = {content_key(c) for c in pool}
+
+    dep_parents: dict = {}   # rule_stem -> set(parent content_key)
+    dep_score:   dict = {}   # rule_stem -> best parent relevance that names it
+    for c in pool:
+        cat = c["metadata"].get("category", "")
+        if cat in ("Core_Rules", mp_cat):                 # parents here are non-rule only
+            continue
+        rel = boosted_score(c, edition, mission_pack_mode)
+        if rel < config.REFERENCED_PARENT_MIN:            # only strongly-relevant abilities
+            continue
+        text = c["text"]
+        for rx, rstem in index:
+            if rx.search(text):
+                dep_parents.setdefault(rstem, set()).add(content_key(c))
+                dep_score[rstem] = max(dep_score.get(rstem, -1.0), rel)
+    return _gate_and_build(dep_parents, dep_score, seed, allowed, present,
+                           config.REFERENCED_PARENT_MIN)
+
+
+def rank_seeded_below_parents(chunks: list, edition: str, mission_pack_mode: bool) -> None:
+    """Override each seeded dep's rerank score so it rides JUST BELOW the weakest
+    parent that sourced it — the parent-cap, on the reranked parent score. The
+    cross-encoder scores a seeded dep ~0 (it judges a *dependency*/referenced rule as
+    irrelevant), so we replace that with a parent-derived score. Parents are matched
+    by content_key (works for rule parents AND unit/ability parents). Mutates in
+    place; call AFTER rerank_pools and BEFORE assemble_context. See §8d/§8e."""
+    score_by_key = {content_key(c): boosted_score(c, edition, mission_pack_mode)
+                    for c in chunks if not c.get("dep_seed")}
+    deps = [c for c in chunks if c.get("dep_seed")]
+    # strongest-bridge dep first so the EPS ladder keeps a stable, sensible order
+    for i, dep in enumerate(sorted(deps, key=lambda c: c.get("dep_bridge", 0), reverse=True)):
+        ps = [score_by_key[k] for k in dep.get("dep_parent_keys", []) if k in score_by_key]
+        if not ps:
+            continue
+        eff = min(ps) - config.RULES_BOOST_DEP - i * config.DEP_SCORE_EPS
+        # stamp rerank so boosted_score(dep) == eff (just below the weakest parent)
+        dep["rerank"] = round(eff - authority_boost(dep["metadata"], edition, mission_pack_mode), 4)
+
+
+def _reserve_unit_chunks(unit_chunks: list, reserved_keys: set, rank) -> list:
+    """Per-unit reservation: group the named-unit slice by unit and keep each unit's
+    best chunk (the query NAMING the unit is the relevance signal), plus its 2nd chunk
+    unless that 2nd is legitimately irrelevant. Per-unit (not global) so one named unit
+    can't sweep the slots from another in a multi-unit question.
+
+    "Legitimately irrelevant 2nd" is judged RELATIVELY (within UNIT_SECOND_RATIO of the
+    unit's own best) — BUT only when the best chunk's score is itself meaningful
+    (≥ UNIT_SECOND_FLOOR). When the reranker rates a unit's whole chunk set near-zero
+    (a generic ability question — Snikrot's chunks 0.027/0.004), it cannot distinguish
+    them, so the ratio would amplify pure noise into a spurious "6× worse" drop and lose
+    a genuinely useful chunk (Snikrot's datasheet, which proves he HAS Infiltrators).
+    Below the floor we keep both — same reasoning that sets the absolute gate to 0."""
+    by_unit = defaultdict(list)
+    for c in deduplicate_chunks(unit_chunks or []):
+        if content_key(c) not in reserved_keys:
+            by_unit[c["metadata"].get("unit_name", "")].append(c)
+    keep = []
+    for chunks in by_unit.values():
+        chunks.sort(key=rank, reverse=True)
+        chosen = chunks[:1]                                   # best chunk: always
+        top    = rank(chosen[0])
+        for c in chunks[1:config.UNIT_CHUNKS_PER_UNIT]:       # up to the per-unit cap
+            indistinct = top < config.UNIT_SECOND_FLOOR       # reranker indifferent → keep
+            if indistinct or rank(c) >= config.UNIT_SECOND_RATIO * top:
+                chosen.append(c)
+        keep.extend(chosen)
+    return keep
 
 def assemble_context(main_chunks: list, rules_chunks: list, edition: str,
-                     mission_pack_mode: bool) -> list:
+                     mission_pack_mode: bool, unit_chunks: list | None = None) -> list:
     """
-    Merge the main semantic results with the guaranteed rules slice:
+    Merge the main semantic results with the two guaranteed slices, governed by the
+    TOKEN budget rather than a hard chunk count:
       • reserve up to TOP_K_RULES slots for the best rules chunks,
-      • fill the remaining slots with the best main (datasheet/ability) chunks,
-      • order the final set by authority-boosted score.
+      • reserve up to UNIT_CHUNKS_PER_UNIT chunks PER named unit (2nd gated relatively),
+      • fill the remainder up to the TOP_K *target* with the best main chunks above
+        REST_GATE.
+    Reservations may push the total past TOP_K (a multi-unit question needs the room);
+    the hard ceiling is RULES_CONTEXT_TOKEN_BUDGET, applied later by
+    format_rules_context. Output is ordered RESERVED-FIRST (each group by score) so the
+    guaranteed rules/units survive budget truncation; discretionary fill packs last and
+    is dropped first. Simple single-topic queries still come out at ~TOP_K — lean on
+    purpose for multi-turn TPM headroom.
     """
     rank = lambda c: boosted_score(c, edition, mission_pack_mode)
 
     rules_sorted    = sorted(deduplicate_chunks(rules_chunks), key=rank, reverse=True)
     guaranteed      = rules_sorted[:config.TOP_K_RULES]
-    guaranteed_keys = {content_key(c) for c in guaranteed}
+    reserved_keys   = {content_key(c) for c in guaranteed}
 
+    units_keep    = _reserve_unit_chunks(unit_chunks, reserved_keys, rank)
+    reserved_keys |= {content_key(c) for c in units_keep}
+
+    reserved   = sorted(guaranteed + units_keep, key=rank, reverse=True)
+    rest_slots = max(0, config.TOP_K - len(reserved))         # target TOP_K, not a cap
     main_sorted = sorted(deduplicate_chunks(main_chunks), key=rank, reverse=True)
-    rest        = [c for c in main_sorted if content_key(c) not in guaranteed_keys]
+    rest = [c for c in main_sorted
+            if content_key(c) not in reserved_keys
+            and rank(c) >= config.REST_GATE][:rest_slots]
 
-    final = deduplicate_chunks(guaranteed + rest)[:config.TOP_K]
-    return sorted(final, key=rank, reverse=True)
+    # Reserved-first so the 2800-token budget (format_rules_context) truncates the
+    # discretionary fill before any guaranteed rule/unit chunk.
+    return reserved + rest
 
-# ── Ambiguity detection ───────────────────────────────────────────────────────
-
-def detect_ambiguity(chunks: list, query: str) -> list[tuple] | None:
-    """
-    Returns (label, unit_name, army) options if the query is ambiguous across
-    multiple distinct units with genuinely different content. Returns None
-    otherwise. Runs on RAW (pre-dedup) chunks so all variants are visible.
-    Only considers Datasheet and Ability chunks — not Datasheet_Section,
-    Stratagem, or rules chunks.
-    """
-    unit_chunks = [c for c in chunks
-                   if c["metadata"].get("category") in ("Datasheet", "Ability")]
-    if len(unit_chunks) < 2:
-        return None
-
-    units_seen = defaultdict(list)
-    for chunk in unit_chunks:
-        unit_name = chunk["metadata"].get("unit_name", "").strip()
-        army      = chunk["metadata"].get("army", "").strip()
-        if unit_name:
-            units_seen[unit_name].append(army)
-
-    query_words = [w for w in query.lower().split() if len(w) > 3]
-    ambiguous   = []
-    for unit_name, armies in units_seen.items():
-        name_words = unit_name.lower().split()
-        if any(w in query_words for w in name_words if len(w) > 3):
-            if len(set(f"{unit_name}|{a}" for a in armies)) > 1 or len(armies) > 1:
-                ambiguous.append(unit_name)
-
-    if not ambiguous:
-        return None
-
-    options = []
-    seen    = set()
-    for chunk in unit_chunks:
-        unit_name = chunk["metadata"].get("unit_name", "").strip()
-        army      = chunk["metadata"].get("army", "").strip()
-        label     = f"{unit_name} ({army})" if army else unit_name
-        if label not in seen and any(amb.lower() in unit_name.lower() for amb in ambiguous):
-            seen.add(label)
-            options.append((label, unit_name, army))
-
-    return options[:8] if len(options) >= 2 else None
-
-# ── Unit section fetch ────────────────────────────────────────────────────────
-
-def fetch_unit_sections(unit_name: str, army: str, edition: str) -> list[dict]:
-    """
-    Fetch Datasheet_Section chunks (Transport, Keywords, Composition, etc.)
-    for a specific unit by name and army.
-
-    These focused chunks exist in ChromaDB from ingest.py Pass 3 but won't
-    always surface via semantic search when the query topic differs from the
-    section content (e.g. a question about charging won't retrieve a Transport
-    capacity section). This function injects them explicitly after clarification
-    so the LLM always has transport capacity and keyword restrictions in context
-    when ruling on unit-specific questions — enabling it to catch illegal game
-    states per system prompt rule 8.
-    """
-    collection = get_collection(edition)
-    try:
-        results = collection.query(
-            query_texts=[unit_name],
-            n_results=5,
-            where={"$and": [
-                {"army":      army},
-                {"category":  "Datasheet_Section"},
-                {"unit_name": unit_name},   # exact match — prevents similar units bleeding in
-            ]},
-            include=["documents", "metadatas", "distances"],
-        )
-        return [
-            {"text": doc, "metadata": meta, "similarity": round(1 - dist, 3)}
-            for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-            )
-        ]
-    except Exception:
-        return []
 
 # ── Sequence neighbour injection (Layer 2 Track C) ────────────────────────────
 
@@ -733,6 +1132,55 @@ def inject_sequence_neighbors(chunks: list, edition: str) -> list:
                 result.append(nb)
     return result
 
+# ── Dependency-aware definition boosting (Layer 2 Track E) ────────────────────
+
+def _dep_stem(cid: str) -> str:
+    """Chunk id -> dep-graph stem (the on-disk rule-block stem)."""
+    return cid[len("core_rules_"):] if cid.startswith("core_rules_") else cid
+
+def _dep_boost_cats(edition: str, mission_pack_mode: bool) -> set:
+    """Categories eligible to source/seed a dependency boost — Core Rules always,
+    the mission-pack category ONLY when the toggle is on. Mirrors rules_where, so
+    the mission-pack HARD INVARIANT holds: toggle off ⇒ no mission-pack dep is ever
+    seeded, and a core parent can never seed a mission-pack chunk."""
+    mp = config.get_edition(edition)["mission_pack"]["category"]
+    return {"Core_Rules"} | ({mp} if mission_pack_mode else set())
+
+@st.cache_resource
+def get_dep_graph(edition: str) -> dict:
+    """Load the ratified dependency-graph artifact: stem -> [dep_stem, ...].
+    Absent file ⇒ {} ⇒ the feature no-ops. Keys starting with '_' are metadata."""
+    path = ROOT / config.RULES_DEP_GRAPH_PATH.format(edition=edition)
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+@st.cache_resource
+def get_dep_index(edition: str):
+    """Built once per edition from the rule-chunk universe:
+      bc_to_stem: breadcrumb -> stem   (identify a surfaced chunk's stem)
+      seed:       stem -> chunk payload (seed a missing dep into the pool by stem)
+    Restricted to rule categories (Core_Rules + mission-pack) so only rules can be
+    sourced or seeded."""
+    col  = get_collection(edition)
+    data = col.get(include=["documents", "metadatas"])
+    mp   = config.get_edition(edition)["mission_pack"]["category"]
+    bc_to_stem, seed = {}, {}
+    for cid, doc, meta in zip(data["ids"], data["documents"], data["metadatas"]):
+        if meta.get("category") not in ("Core_Rules", mp):
+            continue
+        s = _dep_stem(cid)
+        seed[s] = {"text": doc, "metadata": meta}
+        bc = meta.get("breadcrumb")
+        if bc and bc not in bc_to_stem:
+            bc_to_stem[bc] = s
+    return bc_to_stem, seed
+
+
 # ── Prompt builder ────────────────────────────────────────────────────────────
 
 def system_prompt(edition: str) -> str:
@@ -749,6 +1197,7 @@ Rules:
 6. CRITICAL: Never infer or extrapolate rules that are not explicitly stated in the context. If an ability says 'Normal move', it means Normal move only — do not assume it also applies to Advance moves, Fall Back moves, or any other move type unless the rule explicitly says so.
 7. If a rule citation appears to be cut off or incomplete, say so explicitly rather than ruling based on partial text.
 8. If a question contains an illegal game state (e.g. a unit embarked in a transport it cannot legally embark in, based on transport capacity or keyword restrictions in the provided context), identify and state the illegal premise before ruling on any other aspect of the question.
+9. When a datasheet's weapon or ability names a keyword or rule (e.g. [DEVASTATING WOUNDS], Feel No Pain, Deadly Demise, Infiltrators) AND that rule's text is present in the context, cite and apply that provided rule explicitly. Do NOT call it 'implied', 'standard', or rule from memory when the actual rule chunk is in front of you.
 """
 
 def mission_pack_context(edition: str) -> str:
@@ -762,34 +1211,20 @@ def estimate_tokens(text: str) -> int:
     """Cheap ~chars/token proxy — avoids a tokenizer dependency on the hot path."""
     return len(text) // config.TOKEN_CHAR_RATIO
 
-def truncate_to_lines(text: str, token_budget: int, force_first: bool = False) -> str:
-    """
-    Trim text to fit token_budget, cutting only at line boundaries so a rule is
-    never sliced mid-sentence (system-prompt rule 7). With force_first, always
-    keep at least the first line even if it overflows — used only for the very
-    first chunk so an otherwise-empty context still shows something.
-    """
-    if token_budget <= 0 and not force_first:
-        return ""
-    out, used = [], 0
-    for line in text.split("\n"):
-        cost = estimate_tokens(line) + 1
-        if used + cost > token_budget and not (force_first and not out):
-            break
-        out.append(line)
-        used += cost
-    return "\n".join(out)
 
 SEP        = "\n\n---\n\n"
 SEP_TOKENS = len(SEP) // config.TOKEN_CHAR_RATIO + 1
 
 def format_rules_context(chunks: list, token_budget: int) -> str:
     """
-    Assemble the rules context within token_budget. Chunks arrive pre-ranked
-    (rules first, via assemble_context); add whole chunks greedily, then
-    line-truncate the boundary chunk to use the remaining budget. Lower-ranked
-    chunks that don't fit are dropped rather than overrunning the budget — only
-    the first chunk may overflow (so context is never empty).
+    Assemble the rules context from WHOLE chunks — a rule is never cut mid-text.
+    Chunks arrive pre-ranked (reserved rules/units first, via assemble_context); each
+    is added in full. token_budget is a SOFT target: the chunk that crosses it is still
+    added whole (so an adjudication-critical rule is never reduced to a misleading
+    header), and we stop after it. Rules chunks are ~300 tokens, so the total lands
+    near the budget and tops out around budget + one chunk (~3k) in the worst case —
+    an accepted overrun to guarantee no truncation. Lower-priority chunks past that
+    are dropped whole, never sliced.
     """
     if not chunks:
         return "No relevant rules found for this query."
@@ -798,19 +1233,11 @@ def format_rules_context(chunks: list, token_budget: int) -> str:
         meta  = chunk["metadata"]
         label = f"[{i}] {meta.get('unit_name') or meta.get('category', 'Rule')} ({meta.get('army', '')})"
         block = f"{label}\n{chunk['text']}"
-        sep   = SEP_TOKENS if parts else 0
-        cost  = estimate_tokens(block) + sep
-        if used + cost <= token_budget:
-            parts.append(block)
-            used += cost
-            continue
-        # Boundary chunk: fit whole leading lines into the remaining budget.
-        remaining = token_budget - used - sep - estimate_tokens(label) - 1
-        trimmed   = truncate_to_lines(chunk["text"], remaining, force_first=not parts)
-        if trimmed:
-            parts.append(f"{label}\n{trimmed}")
-        break
-    return SEP.join(parts) if parts else "No relevant rules found for this query."
+        parts.append(block)
+        used += estimate_tokens(block) + (SEP_TOKENS if len(parts) > 1 else 0)
+        if used >= token_budget:      # included this chunk whole; stop before adding more
+            break
+    return SEP.join(parts)
 
 def build_messages(conversation: list, chunks: list, user_query: str,
                    edition: str, mission_pack_mode: bool = True,
@@ -846,7 +1273,7 @@ def _complete(messages: list) -> str:
     client   = get_llm_client()
     response = client.chat.completions.create(
         model=config.LLM_MODEL, messages=messages,
-        max_tokens=config.MAX_OUTPUT_TOKENS, temperature=0.1,
+        max_completion_tokens=config.MAX_OUTPUT_TOKENS, temperature=0.1,
     )
     raw    = response.choices[0].message.content
     answer = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
@@ -893,10 +1320,20 @@ def init_session():
         "mission_pack_mode":     True,
         "refined_query":         None,
         "pending_clarification": None,
+        "unit_resolution":       None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+    # Warm the Layer-3 models (cross-encoder + span-bridge embedder) once at startup
+    # so the first query doesn't pay the ~3.3 s cold load. @st.cache_resource means
+    # this runs only on the first session; failures degrade gracefully (cosine path).
+    try:
+        get_reranker()
+        get_embedder()
+    except Exception:
+        pass
 
 # ── Per-edition theming ───────────────────────────────────────────────────────
 
@@ -937,7 +1374,7 @@ def render_sidebar():
             # contexts from different editions never mix.
             if chosen != st.session_state.edition:
                 for key in ["messages", "last_chunks", "viewing_conv_id", "current_conv_id",
-                            "refined_query", "pending_clarification"]:
+                            "refined_query", "pending_clarification", "unit_resolution"]:
                     st.session_state[key] = [] if key in ("messages", "last_chunks") else None
                 st.session_state.edition = chosen
                 st.rerun()
@@ -955,7 +1392,7 @@ def render_sidebar():
 
         if st.button("➕ New Chat", use_container_width=True, type="primary"):
             for key in ["messages", "last_chunks", "viewing_conv_id", "current_conv_id",
-                        "refined_query", "pending_clarification"]:
+                        "refined_query", "pending_clarification", "unit_resolution"]:
                 st.session_state[key] = [] if key in ("messages", "last_chunks") else None
             st.rerun()
 
@@ -1025,19 +1462,32 @@ def render_chat():
                     and not st.session_state.pending_clarification):
                 render_source_expander(st.session_state.last_chunks)
 
-    # ── Persistent clarification buttons ─────────────────────────────────────
+    # ── Persistent clarification buttons (SEQUENTIAL — one unit per round) ─────
+    # pending_clarification is the queue state {query, queue, resolved, options}.
+    # Each round we render the next unresolved unit's faction buttons; a click
+    # records the pick and advances the queue. When the queue drains we hand off to
+    # the pipeline with every faction pinned (no re-prompt).
     if st.session_state.pending_clarification:
-        options, original_query = st.session_state.pending_clarification
-        st.markdown("**Select a unit:**")
-        for row_start in range(0, len(options), 3):
-            row_options = options[row_start:row_start + 3]
-            cols = st.columns(len(row_options))
-            for col, (label, unit_name, army) in zip(cols, row_options):
-                if col.button(label, key=f"clarify_{label}"):
-                    st.session_state.pending_clarification = None
-                    st.session_state.refined_query = f"{original_query} — specifically the {label}"
-                    st.rerun()
-        return
+        nxt = next_clarification(st.session_state.pending_clarification)
+        if nxt is not None:
+            unit_name, options = nxt
+            st.markdown(f"**Which faction's _{unit_name}_?**")
+            for row_start in range(0, len(options), 3):
+                row_options = options[row_start:row_start + 3]
+                cols = st.columns(len(row_options))
+                for col, (label, u_name, army) in zip(cols, row_options):
+                    if col.button(label, key=f"clarify_{u_name}_{army}"):
+                        st.session_state.pending_clarification = apply_clarification(
+                            st.session_state.pending_clarification, u_name, army)
+                        st.rerun()
+            return
+        # Queue drained → run the pipeline once for the original query. refined_query
+        # suppresses re-prompting; unit_resolution pins each unit's army for the slice.
+        _state = st.session_state.pending_clarification
+        _picks = ", ".join(f"{u} ({a})" for u, a in _state["resolved"].items())
+        st.session_state.refined_query         = f'{_state["query"]} — specifically the {_picks}'
+        st.session_state.unit_resolution       = _state["resolved"]
+        st.session_state.pending_clarification = None
 
     # ── Determine active input ────────────────────────────────────────────────
     active_input = None
@@ -1055,6 +1505,32 @@ def render_chat():
     with st.chat_message("user"):
         st.markdown(active_input)
 
+    # A refined query already carries its faction resolution (set when the
+    # clarification queue drained); a fresh query is eligible for disambiguation.
+    is_refined = (active_input != user_input)
+    resolution = st.session_state.unit_resolution or {}
+    st.session_state.unit_resolution = None
+
+    # ── Disambiguation FIRST (deterministic, metadata-driven) ─────────────────
+    # If a fresh query names any multi-faction unit with no faction pinned, ask —
+    # sequentially, one unit per round — BEFORE the heavy retrieve/seed/rerank, so
+    # that work runs only once the faction(s) are known. Replaces the old post-
+    # retrieval detect_ambiguity gate, which could not see a unit that failed to
+    # surface semantically.
+    if not is_refined:
+        clarify = build_clarification_queue(
+            active_input, edition, st.session_state.selected_faction)
+        if clarify:
+            st.session_state.pending_clarification = clarify
+            st.session_state.messages.append({"role": "user", "content": active_input})
+            st.session_state.messages.append({"role": "assistant",
+                "content": "⚖️ **Clarification needed** — more than one faction fields "
+                           "this unit. Which did you mean?"})
+            st.session_state.last_chunks = []
+            upsert_conversation(st.session_state.messages, user, edition)
+            st.rerun()
+            return
+
     # ── Process query ─────────────────────────────────────────────────────────
     expanded_query, auto_where, _ = process_query(
         active_input, edition, mission_pack_mode=st.session_state.mission_pack_mode
@@ -1062,14 +1538,17 @@ def render_chat():
     if st.session_state.selected_faction != "All Factions" and auto_where is None:
         auto_where = {"army": st.session_state.selected_faction}
 
-    # Retrieve extra candidates so dedup still fills TOP_K slots after
-    # collapsing identical chunks. Ambiguity detection runs on raw chunks
-    # so all unit variants are visible for clarification buttons.
-    chunks_raw = retrieve(expanded_query, auto_where, edition, n_results=config.TOP_K * 3)
+    # Retrieve a wide candidate pool for the reranker to sort (and so dedup still
+    # fills TOP_K slots after collapsing identical chunks).
+    chunks_raw = retrieve(expanded_query, auto_where, edition,
+                          n_results=config.RERANK_CANDIDATES)
 
-    # Ambiguity check on raw chunks — only for fresh (non-refined) queries
-    is_refined = (active_input != user_input)
-    options    = None if is_refined else detect_ambiguity(chunks_raw, active_input)
+    # Guaranteed UNIT slice: metadata-sourced chunks for the datasheet(s) the query
+    # names (army pinned by `resolution`), so a named unit reaches context even when
+    # it doesn't embed near the query. Reranked with everything else; assemble_context
+    # reserves the best per-unit chunks without forcing them to rank 1.
+    unit_raw = retrieve_unit_slice(active_input, edition,
+                                   st.session_state.mission_pack_mode, resolution)
 
     # Guaranteed rules slice: a second, category-scoped query for Core Rules
     # (and, only when the mission-pack toggle is on, mission-pack rules) so they
@@ -1081,39 +1560,32 @@ def render_chat():
         n_results=config.TOP_K_RULES * 2,
     )
 
-    # Merge: reserve TOP_K_RULES slots for rules, fill the rest with the best
-    # datasheet/ability matches, order by authority-boosted score.
+    # Layer 3. Order: SEED the rules a surfaced chunk depends on into the pool — the
+    # definitions a rule references (seed_definitions) and the core/mission-pack rules
+    # a unit/ability references as context (seed_referenced_rules), both below the
+    # bi-encoder candidacy ceiling — then RERANK the whole pool by joint (query,
+    # passage) relevance, then cap each seeded dep just below its reranked parent
+    # (rank_seeded_below_parents, since the cross-encoder rates a dependency ~0).
+    # assemble_context then caps at TOP_K / the 2800-tok budget. See spec/reranker.md.
+    mp_mode      = st.session_state.mission_pack_mode
+    rerank_query = expanded_query if config.RERANK_USE_EXPANDED else active_input
+    pool         = chunks_raw + rules_raw
+    chunks_raw   = chunks_raw + seed_definitions(rerank_query, pool, edition, mp_mode) \
+                             + seed_referenced_rules(rerank_query, pool, edition, mp_mode)
+    rerank_pools(rerank_query, edition, mp_mode, chunks_raw, rules_raw, unit_raw)
+    rank_seeded_below_parents(chunks_raw + rules_raw, edition, mp_mode)
+
+    # Merge: reserve TOP_K_RULES slots for rules and up to UNIT_CHUNKS_PER_UNIT chunks
+    # per named unit, fill toward the TOP_K target with the best datasheet/ability
+    # matches; the 2800-token budget is the hard ceiling. The unit slice already carries
+    # the unit's focused Datasheet_Section chunks (Transport, Keywords, …) — relevance-
+    # ranked into the reserved slots — so no separate fetch_unit_sections injection is needed.
     chunks = assemble_context(
         chunks_raw, rules_raw, edition,
         mission_pack_mode=st.session_state.mission_pack_mode,
+        unit_chunks=unit_raw,
     )
 
-    # For refined queries, inject Datasheet_Section chunks (Transport capacity,
-    # Keywords, etc.) for the selected unit. These have focused embeddings from
-    # ingest Pass 3 but won't surface via semantic search when the query topic
-    # differs from the section content. Injecting them guarantees the LLM has
-    # transport restrictions in context to catch illegal game states (rule 8).
-    if is_refined:
-        match = re.search(r'specifically the (.+?) \((.+?)\)$', active_input)
-        if match:
-            unit_name      = match.group(1).strip()
-            army           = match.group(2).strip()
-            section_chunks = fetch_unit_sections(unit_name, army, edition)
-            existing_ids   = {hashlib.md5(c["text"].encode()).hexdigest() for c in chunks}
-            for sc in section_chunks:
-                if hashlib.md5(sc["text"].encode()).hexdigest() not in existing_ids:
-                    chunks.insert(0, sc)
-            chunks = chunks[:config.TOP_K]
-
-    if options:
-        clarification_text = "⚖️ **Clarification needed** — multiple distinct units match your query. Which did you mean?"
-        st.session_state.pending_clarification = (options, active_input)
-        st.session_state.messages.append({"role": "user",      "content": active_input})
-        st.session_state.messages.append({"role": "assistant", "content": clarification_text})
-        st.session_state.last_chunks = chunks
-        upsert_conversation(st.session_state.messages, user, edition)
-        st.rerun()
-        return
 
     # Track C: when a retrieved chunk is part of a curated ordered sequence, pull
     # its neighbors so the full sequence reaches the LLM. The token allocator
