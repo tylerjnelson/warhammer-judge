@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 build_dep_graph.py — DRAFT the Layer-2 Track-E dependency graph + GATE the
-ratified artifact. No LLM, no network. Spec: spec/dependency-boost.md.
+ratified artifact. No LLM, no network. Spec: spec/reranker.md §7–§8e (the graph is
+now consumed by seed_definitions; the old spec/dependency-boost.md was removed
+2026-06-20 when HYBRID_DEP_BOOST/inject_dependency_boosts were retired).
 
 The runtime reads a HAND-RATIFIED artifact (data/dep_graph_<edition>.json). This
 script does two things:
