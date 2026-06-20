@@ -492,44 +492,175 @@ def unit_armies(unit_name: str, edition: str) -> list[str]:
         return []
     return sorted({m.get("army") for m in res["metadatas"] if m.get("army")})
 
-def clarification_options(unit_name: str, edition: str) -> list[tuple]:
-    """(label, unit_name, army) choices for one multi-faction unit."""
-    return [(f"{unit_name} ({a})", unit_name, a) for a in unit_armies(unit_name, edition)]
+# ── Chassis disambiguation (faction-first → variant) ──────────────────────────
+# A "chassis" is a datasheet name that is a substring of OTHER datasheet names
+# ("Land Raider" ⊂ "Land Raider Crusader", "Venerable Land Raider", …). A bare
+# chassis word in a query (resolve_named_units returns the base name) must fan out
+# to the whole family so the user can pick faction, then variant — instead of being
+# silently pinned to the lone datasheet literally named "Land Raider" (GK/SM only).
+
+def is_chassis_base(name: str, all_names: list[str]) -> bool:
+    """True if `name` is a proper substring of some OTHER datasheet name — i.e. it is
+    a shared chassis with more specific variants, not a leaf datasheet."""
+    low = name.lower()
+    return any(o != name and low in o.lower() for o in all_names)
+
+def _variant_signature(unit_name: str, army: str, edition: str) -> str:
+    """Stable hash of a datasheet's rules text (army-scoped), so two differently
+    NAMED variants with identical rules collapse to one button. Reuses content_key
+    (which strips unit/faction/category headers) over the unit's own chunks."""
+    collection = get_collection(edition)
+    where = {"$and": [{"unit_name": unit_name}, {"army": army},
+                      {"category": {"$in": list(UNIT_SLICE_CATEGORIES)}}]}
+    try:
+        res = collection.get(where=where, include=["documents"])
+    except Exception:
+        return unit_name  # degrade to name-only dedup
+    keys = sorted(content_key({"text": d}) for d in res["documents"])
+    return hashlib.md5("".join(keys).encode()).hexdigest() if keys else unit_name
+
+@st.cache_resource
+def chassis_family(ref: str, edition: str) -> dict:
+    """{army: [variant datasheet names]} for the chassis a query reference names.
+
+    For a chassis base ('Land Raider') the family is every datasheet whose name
+    contains the base; for a leaf ('Land Raider Crusader', 'Abaddon …') it is just
+    that one name. Within each army, variants whose rules are byte-identical are
+    deduped (rules-signature) so a faction never shows two buttons for the same unit.
+    """
+    names, _ = get_unit_name_resolver(edition)
+    low = ref.lower()
+    family_names = ([n for n in names if low in n.lower()]
+                    if is_chassis_base(ref, names) else [ref])
+    by_army: dict = defaultdict(list)
+    for nm in family_names:
+        for army in unit_armies(nm, edition):
+            by_army[army].append(nm)
+    out = {}
+    for army, variants in by_army.items():
+        seen, deduped = {}, []
+        for nm in sorted(set(variants)):
+            sig = _variant_signature(nm, army, edition)
+            if sig not in seen:
+                seen[sig] = nm
+                deduped.append(nm)
+        out[army] = deduped
+    return out
+
+def _new_unit_state(ref: str, family: dict, pinned: str | None):
+    """Per-reference clarification sub-state, or a finalized {ref,unit_name,army}
+    resolution when no question is needed. Returns ("ask", unit_dict) |
+    ("auto", resolution_dict) | ("skip", None)."""
+    if pinned:
+        if pinned not in family:
+            return "skip", None          # pinned faction doesn't field this unit
+        variants = family[pinned]
+        if len(variants) <= 1:
+            return "auto", {"ref": ref, "unit_name": variants[0], "army": pinned}
+        return "ask", {"ref": ref, "family": {pinned: variants},
+                       "stage": "variant", "army": pinned}
+    armies = list(family)
+    if len(armies) == 1:
+        variants = family[armies[0]]
+        if len(variants) <= 1:
+            return "auto", {"ref": ref, "unit_name": variants[0], "army": armies[0]}
+        return "ask", {"ref": ref, "family": family, "stage": "variant",
+                       "army": armies[0]}
+    return "ask", {"ref": ref, "family": family, "stage": "faction", "army": None}
 
 def build_clarification_queue(query: str, edition: str,
                               selected_faction: str | None = None) -> dict | None:
-    """Sequential disambiguation state for every multi-faction unit the query names
-    while no faction is pinned. Returns the pending-clarification dict, or None if
-    nothing needs disambiguating. Runs BEFORE retrieval/rerank so the heavy work only
-    happens once the faction(s) are known.
+    """Two-stage (faction → variant) disambiguation state for every chassis / multi-
+    faction unit the query names. Runs BEFORE retrieval/rerank so the heavy work only
+    happens once faction(s) and variant(s) are known. Returns None when nothing the
+    query names needs disambiguating (single-faction leaf, no unit, …).
 
-      {"query", "queue": [unit, ...], "resolved": {unit: army}, "options": {unit: [...]}}
+      {"query", "units": [{ref, family, stage, army}, ...],
+       "resolved": [{ref, unit_name, army}, ...]}
+
+    `units` are the pending prompts (in order); `resolved` accumulates the picks that
+    needed no question (a faction that fields exactly one variant auto-resolves).
     """
     _, factions = build_faction_keyword_map(edition)
-    if (selected_faction and selected_faction != "All Factions") \
-            or detect_faction(query, factions):
-        return None  # faction pinned (sidebar or query) → resolve without asking
-    queue, options = [], {}
-    for u in resolve_named_units(query, edition):
-        if len(unit_armies(u, edition)) > 1:
-            queue.append(u)
-            options[u] = clarification_options(u, edition)
-    if not queue:
+    pinned = None
+    if selected_faction and selected_faction != "All Factions":
+        pinned = selected_faction
+    else:
+        pinned = detect_faction(query, factions)
+
+    names, _ = get_unit_name_resolver(edition)
+    units, resolved = [], []
+    for ref in resolve_named_units(query, edition):
+        # Only chassis bases or multi-faction leaves are ambiguous; a single-faction
+        # leaf needs no prompt (retrieve_unit_slice derives its sole army).
+        if not is_chassis_base(ref, names) and len(unit_armies(ref, edition)) <= 1:
+            continue
+        family = chassis_family(ref, edition)
+        if not family:
+            continue
+        kind, payload = _new_unit_state(ref, family, pinned)
+        if kind == "ask":
+            units.append(payload)
+        elif kind == "auto":
+            resolved.append(payload)
+    if not units and not resolved:
         return None
-    return {"query": query, "queue": queue, "resolved": {}, "options": options}
+    return {"query": query, "units": units, "resolved": resolved}
 
 def next_clarification(state: dict | None) -> tuple | None:
-    """(unit_name, options) for the next unresolved unit, or None when the queue is done."""
-    if not state or not state.get("queue"):
+    """The next question to render, or None when no prompts remain.
+      ("faction", ref, [army, ...])           — stage 1
+      ("variant", ref, army, [unit_name, ...]) — stage 2
+    """
+    if not state or not state.get("units"):
         return None
-    u = state["queue"][0]
-    return u, state["options"][u]
+    u = state["units"][0]
+    if u["stage"] == "faction":
+        return "faction", u["ref"], sorted(u["family"])
+    return "variant", u["ref"], u["army"], list(u["family"][u["army"]])
 
-def apply_clarification(state: dict, unit_name: str, army: str) -> dict:
-    """Record a faction pick and advance the queue (returns a NEW state dict)."""
-    resolved = {**state["resolved"], unit_name: army}
-    queue    = [u for u in state["queue"] if u != unit_name]
-    return {**state, "resolved": resolved, "queue": queue}
+def apply_clarification(state: dict, choice: str) -> dict:
+    """Record a button click for the FIRST pending unit and advance (returns a NEW
+    state). At the faction stage `choice` is an army; at the variant stage it is a
+    datasheet name. A faction that fields exactly one variant resolves immediately."""
+    units = [dict(u) for u in state["units"]]
+    resolved = list(state["resolved"])
+    u = units[0]
+    if u["stage"] == "faction":
+        variants = u["family"][choice]
+        if len(variants) == 1:
+            resolved.append({"ref": u["ref"], "unit_name": variants[0], "army": choice})
+            units.pop(0)
+        else:
+            u["army"], u["stage"] = choice, "variant"
+    else:  # variant stage
+        resolved.append({"ref": u["ref"], "unit_name": choice, "army": u["army"]})
+        units.pop(0)
+    return {**state, "units": units, "resolved": resolved}
+
+def highlight_ref(query: str, ref: str) -> str:
+    """Mark the unit reference inside the query (first occurrence, case-insensitive)
+    so the user can see WHICH word the clarification buttons are about."""
+    return re.sub(re.escape(ref), lambda m: f"**:blue[{m.group(0)}]**",
+                  query, count=1, flags=re.IGNORECASE)
+
+def apply_resolution_to_query(query: str, resolved: list) -> str:
+    """Rewrite the query INLINE — replace each chassis reference where it sits with
+    the specific resolved datasheet + faction — rather than appending a trailing
+    "specifically the …" (which leaves the generic word in place and over-weights the
+    unit's own datasheet chunks at rerank). Each ref's first occurrence is replaced
+    once, in resolution order.
+
+    NOTE: refs are keyed by datasheet NAME, so the same chassis named TWICE for two
+    different factions in one query ('a Custodes Land Raider vs a Chaos Land Raider')
+    still collapses to a single resolution — a true mirror needs per-occurrence
+    resolution (a known limitation, tracked separately)."""
+    out = query
+    for r in resolved:
+        out = re.sub(re.escape(r["ref"]),
+                     f'{r["unit_name"]} ({r["army"]})',
+                     out, count=1, flags=re.IGNORECASE)
+    return out
 
 def expand_query(query: str) -> str:
     q = query
@@ -702,33 +833,44 @@ def retrieve_rules_slice(query: str, edition: str, mission_pack_mode: bool,
 UNIT_SLICE_CATEGORIES = ("Datasheet", "Ability", "Datasheet_Section")
 
 def retrieve_unit_slice(query: str, edition: str, mission_pack_mode: bool,
-                        resolution: dict | None = None) -> list[dict]:
+                        resolution: list | dict | None = None) -> list[dict]:
     """Guaranteed candidacy for the datasheet(s) a query NAMES: a metadata fetch
     (NOT semantic) of each named unit's own chunks. A unit that doesn't embed near
     the query — Abaddon's stat block vs a 'Devastating Wounds' question — is still
     placed in the pool, where the reranker scores it and assemble_context reserves
     the best per-unit chunks into context (without forcing them to rank 1).
 
-    Cross-faction (Land Raider ×N) is bounded three ways: the army is pinned to the
-    resolved faction (clarification / faction named in query / sole army); content_key
-    dedup collapses identical text; the reserved-slot cap stops a flood. When a unit
-    is multi-faction and STILL unresolved (e.g. user dismissed clarification), all
-    armies are fetched but dedup + cap keep it bounded.
+    Two sourcing modes:
+      • RESOLVED (clarification done): `resolution` is a list of finalized
+        {"unit_name", "army"} pairs — fetch exactly those (a chassis query resolves
+        "Land Raider" → the specific "Venerable Land Raider"/"Adeptus Custodes").
+      • DERIVED (no clarification needed): `resolution` is empty — fall back to the
+        datasheet name(s) the query names, army pinned by the faction in the query or
+        the unit's sole army; an unresolved multi-faction unit fetches all armies
+        (dedup + the reserved-slot cap keep it bounded).
 
     similarity defaults to 0.0 (not None) so degraded cosine mode — reranker failed
     to load — still sorts these without a crash; they just rank low but stay present.
     """
-    resolution  = resolution or {}
-    _, factions = build_faction_keyword_map(edition)
-    q_faction   = detect_faction(query, factions)
-    collection  = get_collection(edition)
-    cats        = {"$in": list(UNIT_SLICE_CATEGORIES)}
+    collection = get_collection(edition)
+    cats       = {"$in": list(UNIT_SLICE_CATEGORIES)}
+
+    # Build the (unit_name, army|None) fetch list.
+    targets: list[tuple] = []
+    if resolution:  # finalized list from the clarification flow
+        targets = [(r["unit_name"], r.get("army")) for r in resolution]
+    else:
+        _, factions = build_faction_keyword_map(edition)
+        q_faction   = detect_faction(query, factions)
+        for unit in resolve_named_units(query, edition):
+            armies = unit_armies(unit, edition)
+            army   = q_faction or (armies[0] if len(armies) == 1 else None)
+            targets.append((unit, army))
+
     out = []
-    for unit in resolve_named_units(query, edition):
-        armies = unit_armies(unit, edition)
-        army   = resolution.get(unit) or q_faction or (armies[0] if len(armies) == 1 else None)
-        where  = ({"$and": [{"unit_name": unit}, {"army": army}, {"category": cats}]}
-                  if army else {"$and": [{"unit_name": unit}, {"category": cats}]})
+    for unit, army in targets:
+        where = ({"$and": [{"unit_name": unit}, {"army": army}, {"category": cats}]}
+                 if army else {"$and": [{"unit_name": unit}, {"category": cats}]})
         try:
             res = collection.get(where=where, include=["documents", "metadatas"])
         except Exception:
@@ -965,11 +1107,17 @@ def seed_referenced_rules(query: str, pool: list, edition: str, mission_pack_mod
     NAME, as the rules context needed to understand those abilities (and unit-vs-unit
     interactions). Parent = a surfaced non-rule chunk; dep = the USR it names.
 
-    Gated on the PARENT ability's relevance (≥ REFERENCED_PARENT_MIN), not a span-
-    bridge: a unit question isn't phrased like the rule mechanic, so the rule surfaces
-    because the *ability* that grants it is relevant. Name-match is presence-based (no
-    sentence embedding needed). Capped below the parent by rank_seeded_below_parents.
-    The principled replacement for the blanket authority boost on unit Qs. See §8e."""
+    Gate depends on the PARENT TYPE (both require parent rel ≥ REFERENCED_PARENT_MIN):
+      • ABILITY parent → parent-relevance IS the signal (a unit Q isn't phrased like the
+        mechanic, so the rule surfaces because the ability granting it is relevant —
+        "Obyron Fights First" bridges only 0.176 yet must seed Fights First). KEPT.
+      • non-ability parent (Datasheet stat-block / Datasheet_Section / wargear) →
+        SPAN-BRIDGE gated (query vs the naming sentence). Needed because the cross-
+        encoder SATURATES (~1.0) on every chunk of a NAMED unit, so a unit's Datasheet
+        passes the relevance pre-filter and would otherwise seed every weapon keyword in
+        its wargear table ([SUSTAINED HITS], [DEADLY DEMISE]) on an unrelated question
+        ("can it charge"). A wargear-table row scores ~0.1 against such a query → dropped.
+    Capped below the parent by rank_seeded_below_parents. See §8e."""
     index = get_rule_name_index(edition)
     if not index:
         return []
@@ -977,23 +1125,37 @@ def seed_referenced_rules(query: str, pool: list, edition: str, mission_pack_mod
     allowed  = _dep_boost_cats(edition, mission_pack_mode)
     mp_cat   = config.get_edition(edition)["mission_pack"]["category"]
     present  = {content_key(c) for c in pool}
+    qv       = get_embedder().encode([query])[0]
 
     dep_parents: dict = {}   # rule_stem -> set(parent content_key)
-    dep_score:   dict = {}   # rule_stem -> best parent relevance that names it
+    dep_bridge:  dict = {}   # rule_stem -> gate score (parent rel for abilities, else span)
     for c in pool:
         cat = c["metadata"].get("category", "")
         if cat in ("Core_Rules", mp_cat):                 # parents here are non-rule only
             continue
         rel = boosted_score(c, edition, mission_pack_mode)
-        if rel < config.REFERENCED_PARENT_MIN:            # only strongly-relevant abilities
+        if rel < config.REFERENCED_PARENT_MIN:            # only strongly-relevant parents
             continue
-        text = c["text"]
-        for rx, rstem in index:
-            if rx.search(text):
+        matched = [(rx, rstem) for rx, rstem in index if rx.search(c["text"])]
+        if not matched:
+            continue
+        if cat == "Ability":
+            # ability parent: relevance of the ability is the gate (original §8e path)
+            for _, rstem in matched:
                 dep_parents.setdefault(rstem, set()).add(content_key(c))
-                dep_score[rstem] = max(dep_score.get(rstem, -1.0), rel)
-    return _gate_and_build(dep_parents, dep_score, seed, allowed, present,
-                           config.REFERENCED_PARENT_MIN)
+                dep_bridge[rstem] = max(dep_bridge.get(rstem, -1.0), rel)
+        else:
+            # stat-block / wargear parent: require the QUERY to be about the naming
+            # sentence, else a saturated Datasheet seeds its whole wargear keyword set.
+            sents, embs = _chunk_sentence_embeddings(c)
+            for rx, rstem in matched:
+                dep_parents.setdefault(rstem, set()).add(content_key(c))
+                naming = [e for s, e in zip(sents, embs) if rx.search(s)]
+                if naming:
+                    dep_bridge[rstem] = max(dep_bridge.get(rstem, -1.0),
+                                            max(_cos(qv, e) for e in naming))
+    return _gate_and_build(dep_parents, dep_bridge, seed, allowed, present,
+                           config.SPAN_GATE_MIN)
 
 
 def rank_seeded_below_parents(chunks: list, edition: str, mission_pack_mode: bool) -> None:
@@ -1022,25 +1184,36 @@ def _reserve_unit_chunks(unit_chunks: list, reserved_keys: set, rank) -> list:
     unless that 2nd is legitimately irrelevant. Per-unit (not global) so one named unit
     can't sweep the slots from another in a multi-unit question.
 
+    SELECTION SIGNAL = rerank + cosine. The cross-encoder SATURATES (~1.0) on every
+    chunk of a named unit when the query names that unit prominently ("can my Venerable
+    Land Raider charge" → Composition, Transport, Assault Ramp ALL ~0.9996), so rerank
+    alone reserves arbitrary stat-block fluff and misses the answer-bearing ability
+    (Assault Ramp, cosine 0.68). Adding the (propagated) cosine breaks that tie. It is a
+    NO-OP when a unit never surfaced semantically (cosine 0 — e.g. Abaddon's datasheet
+    for a "Devastating Wounds" question, where rerank 0.845 already discriminates), so
+    the tuned rerank-only behavior is preserved.
+
     "Legitimately irrelevant 2nd" is judged RELATIVELY (within UNIT_SECOND_RATIO of the
     unit's own best) — BUT only when the best chunk's score is itself meaningful
-    (≥ UNIT_SECOND_FLOOR). When the reranker rates a unit's whole chunk set near-zero
+    (≥ UNIT_SECOND_FLOOR). When the signal rates a unit's whole chunk set near-zero
     (a generic ability question — Snikrot's chunks 0.027/0.004), it cannot distinguish
     them, so the ratio would amplify pure noise into a spurious "6× worse" drop and lose
     a genuinely useful chunk (Snikrot's datasheet, which proves he HAS Infiltrators).
     Below the floor we keep both — same reasoning that sets the absolute gate to 0."""
+    def sel(c):                                               # rerank + cosine
+        return rank(c) + (c.get("similarity") or 0.0)
     by_unit = defaultdict(list)
     for c in deduplicate_chunks(unit_chunks or []):
         if content_key(c) not in reserved_keys:
             by_unit[c["metadata"].get("unit_name", "")].append(c)
     keep = []
     for chunks in by_unit.values():
-        chunks.sort(key=rank, reverse=True)
+        chunks.sort(key=sel, reverse=True)
         chosen = chunks[:1]                                   # best chunk: always
-        top    = rank(chosen[0])
+        top    = sel(chosen[0])
         for c in chunks[1:config.UNIT_CHUNKS_PER_UNIT]:       # up to the per-unit cap
-            indistinct = top < config.UNIT_SECOND_FLOOR       # reranker indifferent → keep
-            if indistinct or rank(c) >= config.UNIT_SECOND_RATIO * top:
+            indistinct = top < config.UNIT_SECOND_FLOOR       # signal indifferent → keep
+            if indistinct or sel(c) >= config.UNIT_SECOND_RATIO * top:
                 chosen.append(c)
         keep.extend(chosen)
     return keep
@@ -1067,15 +1240,40 @@ def assemble_context(main_chunks: list, rules_chunks: list, edition: str,
     guaranteed      = rules_sorted[:config.TOP_K_RULES]
     reserved_keys   = {content_key(c) for c in guaranteed}
 
+    # Propagate the semantic COSINE of any unit-slice chunk that ALSO surfaced in the
+    # main pool onto its slice copy (the metadata fetch leaves slice chunks at 0.0), so
+    # _reserve_unit_chunks can tell a unit's answer-bearing section from its stat-block
+    # fluff even when the cross-encoder saturates on the named unit. No-op for sections
+    # that never surfaced semantically (they stay 0.0).
+    cos_by_key: dict = {}
+    for c in main_chunks:
+        s = c.get("similarity")
+        if s is not None:
+            k = content_key(c)
+            cos_by_key[k] = max(cos_by_key.get(k, 0.0), s)
+    for c in (unit_chunks or []):
+        k = content_key(c)
+        if k in cos_by_key:
+            c["similarity"] = max(c.get("similarity") or 0.0, cos_by_key[k])
+
     units_keep    = _reserve_unit_chunks(unit_chunks, reserved_keys, rank)
     reserved_keys |= {content_key(c) for c in units_keep}
+
+    # A named unit's OTHER sections all rerank ~1.0 (saturated) and would sweep the
+    # discretionary `rest` slots with stat-block fluff (Transport, Composition) over
+    # genuinely different content. The unit is already represented by its reserved
+    # slice — which now reserves the RIGHT section (cosine-aware, above) — so bound the
+    # unit's TOTAL footprint by dropping its extra sections from the fill.
+    capped_units = {c["metadata"].get("unit_name") for c in units_keep
+                    if c["metadata"].get("unit_name")}
 
     reserved   = sorted(guaranteed + units_keep, key=rank, reverse=True)
     rest_slots = max(0, config.TOP_K - len(reserved))         # target TOP_K, not a cap
     main_sorted = sorted(deduplicate_chunks(main_chunks), key=rank, reverse=True)
     rest = [c for c in main_sorted
             if content_key(c) not in reserved_keys
-            and rank(c) >= config.REST_GATE][:rest_slots]
+            and rank(c) >= config.REST_GATE
+            and c["metadata"].get("unit_name") not in capped_units][:rest_slots]
 
     # Reserved-first so the 2800-token budget (format_rules_context) truncates the
     # discretionary fill before any guaranteed rule/unit chunk.
@@ -1430,6 +1628,32 @@ def render_sidebar():
 
 # ── Main chat UI ──────────────────────────────────────────────────────────────
 
+def render_clarification_buttons(state: dict) -> None:
+    """Render the current clarification question + its choice buttons INSIDE the
+    last assistant bubble. A click advances the queue and reruns. Rendering in-bubble
+    (not floating at page bottom) is what keeps the buttons from lingering greyed
+    behind the conversation after a pick."""
+    nxt = next_clarification(state)
+    if nxt is None:
+        return
+    query = state["query"]
+    if nxt[0] == "faction":
+        _, ref, choices = nxt
+        st.markdown(f"Which **army** fields this unit?")
+    else:
+        _, ref, army, choices = nxt
+        st.markdown(f"Which **{ref}** — _{army}_?")
+    st.markdown("> " + highlight_ref(query, ref))
+    # Fixed 3-wide grid + full-width buttons → uniform sizing (no awkward gaps).
+    for row_start in range(0, len(choices), 3):
+        row = choices[row_start:row_start + 3]
+        cols = st.columns(3)
+        for col, choice in zip(cols, row):
+            if col.button(choice, key=f"clarify_{nxt[0]}_{ref}_{choice}",
+                          use_container_width=True):
+                st.session_state.pending_clarification = apply_clarification(state, choice)
+                st.rerun()
+
 def render_chat():
     user    = st.session_state.current_user
     edition = st.session_state.edition
@@ -1453,40 +1677,35 @@ def render_chat():
     st.title(f"⚖️ The Judge · {ed['label']}")
     st.caption(f"Ask any Warhammer 40,000 {ed['label']} rules question.")
 
+    # pending_clarification is the two-stage queue {query, units, resolved}; while a
+    # question is pending we render its buttons INSIDE the last assistant bubble
+    # (render_clarification_buttons) rather than floating them at page bottom.
+    pending      = st.session_state.pending_clarification
+    asking       = bool(pending) and next_clarification(pending) is not None
     for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if (msg["role"] == "assistant"
-                    and i == len(st.session_state.messages) - 1
-                    and st.session_state.last_chunks
-                    and not st.session_state.pending_clarification):
-                render_source_expander(st.session_state.last_chunks)
+            is_last = i == len(st.session_state.messages) - 1
+            if msg["role"] == "assistant" and is_last:
+                if asking:
+                    render_clarification_buttons(pending)
+                elif st.session_state.last_chunks and not pending:
+                    render_source_expander(st.session_state.last_chunks)
 
-    # ── Persistent clarification buttons (SEQUENTIAL — one unit per round) ─────
-    # pending_clarification is the queue state {query, queue, resolved, options}.
-    # Each round we render the next unresolved unit's faction buttons; a click
-    # records the pick and advances the queue. When the queue drains we hand off to
-    # the pipeline with every faction pinned (no re-prompt).
-    if st.session_state.pending_clarification:
-        nxt = next_clarification(st.session_state.pending_clarification)
-        if nxt is not None:
-            unit_name, options = nxt
-            st.markdown(f"**Which faction's _{unit_name}_?**")
-            for row_start in range(0, len(options), 3):
-                row_options = options[row_start:row_start + 3]
-                cols = st.columns(len(row_options))
-                for col, (label, u_name, army) in zip(cols, row_options):
-                    if col.button(label, key=f"clarify_{u_name}_{army}"):
-                        st.session_state.pending_clarification = apply_clarification(
-                            st.session_state.pending_clarification, u_name, army)
-                        st.rerun()
-            return
-        # Queue drained → run the pipeline once for the original query. refined_query
-        # suppresses re-prompting; unit_resolution pins each unit's army for the slice.
-        _state = st.session_state.pending_clarification
-        _picks = ", ".join(f"{u} ({a})" for u, a in _state["resolved"].items())
-        st.session_state.refined_query         = f'{_state["query"]} — specifically the {_picks}'
-        st.session_state.unit_resolution       = _state["resolved"]
+    # A question is on screen (in-bubble) — wait for the click; the rerun it triggers
+    # re-enters here. Don't render the chat input or run the pipeline yet.
+    if asking:
+        return
+
+    # ── Queue drained → hand off to the pipeline once ─────────────────────────
+    # refined_query suppresses re-prompting; unit_resolution pins each unit's
+    # (datasheet, army). The query is rewritten INLINE so the resolved unit replaces
+    # the generic chassis word where it sits (mirrors-safe vs a trailing addendum).
+    if pending:
+        _state = pending
+        st.session_state.refined_query   = apply_resolution_to_query(
+            _state["query"], _state["resolved"])
+        st.session_state.unit_resolution = _state["resolved"]
         st.session_state.pending_clarification = None
 
     # ── Determine active input ────────────────────────────────────────────────
@@ -1520,16 +1739,21 @@ def render_chat():
     if not is_refined:
         clarify = build_clarification_queue(
             active_input, edition, st.session_state.selected_faction)
-        if clarify:
+        if clarify and clarify["units"]:
+            # At least one unit still needs a question — prompt and wait.
             st.session_state.pending_clarification = clarify
             st.session_state.messages.append({"role": "user", "content": active_input})
             st.session_state.messages.append({"role": "assistant",
-                "content": "⚖️ **Clarification needed** — more than one faction fields "
+                "content": "⚖️ **Clarification needed** — more than one option fields "
                            "this unit. Which did you mean?"})
             st.session_state.last_chunks = []
             upsert_conversation(st.session_state.messages, user, edition)
             st.rerun()
             return
+        elif clarify and clarify["resolved"]:
+            # Everything the query named auto-resolved (e.g. a pinned faction fields
+            # exactly one variant) — no question needed; pin the slice and proceed.
+            resolution = clarify["resolved"]
 
     # ── Process query ─────────────────────────────────────────────────────────
     expanded_query, auto_where, _ = process_query(
@@ -1615,10 +1839,20 @@ def render_source_expander(chunks: list):
     with st.expander("📖 View Source Chunks", expanded=False):
         for i, chunk in enumerate(chunks, 1):
             meta = chunk["metadata"]
+            # Show BOTH signals: cosine (semantic) AND the cross-encoder rerank. They
+            # diverge in ways that explain the order — the reranker SATURATES (~1.0) on
+            # any chunk of a named unit, so cosine is the real discriminator among a
+            # unit's sections (Assault Ramp 0.68 vs stat-block fluff 0.0), while it
+            # tanks (~0.0) on rules the cosine rates ~0.5. A seeded unit-slice chunk
+            # carries cosine 0.0 (metadata fetch, never semantically scored).
+            cos  = chunk.get("similarity")
+            rer  = chunk.get("rerank")
+            rer_s = f" · rerank `{round(rer, 3)}`" if rer is not None else ""
+            tag   = " · _unit slice_" if chunk.get("unit_seed") else ""
             st.markdown(
                 f"**[{i}]** {meta.get('unit_name') or meta.get('category', 'Rule')} "
                 f"· {meta.get('army', '')} · {meta.get('category', '')} "
-                f"· similarity: `{chunk['similarity']}`"
+                f"· cosine `{cos}`{rer_s}{tag}"
             )
             st.code(chunk["text"][:600] + ("..." if len(chunk["text"]) > 600 else ""),
                     language="markdown")
