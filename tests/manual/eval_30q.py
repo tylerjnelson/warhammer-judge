@@ -9,7 +9,7 @@ rules (so a single keyword-dense chunk can't satisfy them):
   • CORE      (10) — core-rules questions combining several mechanics
                      (mission-pack toggle OFF).
   • LEVIATHAN (10) — Leviathan mission-pack questions (toggle ON).
-  • UNITS     (10) — named-unit / model interactions whose abilities reference a
+  • UNITS     (11) — named-unit / model interactions whose abilities reference a
                      core or mission-pack rule by name (toggle OFF) — these
                      exercise seed_referenced_rules (ability → rule context).
 
@@ -147,7 +147,7 @@ UNITS = [
      [["trukk"], ["transport capacity", "transport"], ["grot riggers"]],
      {"chunks_for": {"Trukk": 2}}),
 
-    # ── 2 SINGLE-UNIT (simple) ───────────────────────────────────────────────────
+    # ── 3 SINGLE-UNIT (simple) ───────────────────────────────────────────────────
     ("Chief Librarian Mephiston has Fights First. If he is in combat with an enemy "
      "unit that also has Fights First, who fights first?",
      [["fights first"], ["mephiston"]],
@@ -155,6 +155,15 @@ UNITS = [
     ("How does the Aegis Defence Line fortification give units the Benefit of Cover, "
      "and how do models interact with it?",
      [["benefit of cover", "cover"], ["aegis"]],
+     {}),
+    # ABILITY→RULE seeding via an ABILITY parent (the hybrid seed_referenced_rules
+    # path): Obyron's Ghostwalk Mantle NAMES "Fights First", which must seed the core
+    # rule — the 4th group ("whose turn…"/"alternat"/"pile in") lives ONLY in that core
+    # rule, not the ability, so it passes only if the seed actually reached context.
+    ("While Vargard Obyron leads a unit, his Ghostwalk Mantle gives it Fights First — "
+     "how does the Fights First rule resolve when both sides have it in the Fight phase?",
+     [["obyron"], ["ghostwalk mantle"], ["fights first"],
+      ["whose turn is not taking place", "alternat", "pile in"]],
      {}),
 ]
 
