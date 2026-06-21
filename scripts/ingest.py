@@ -102,6 +102,12 @@ def extract_metadata(filepath, content, edition_code="10e"):
     elif stem.startswith("enhancement_"):
         category = "Enhancement"
         doc_id   = stem[12:]
+    elif stem.startswith("army_rule_"):
+        category = "Army_Rule"
+        doc_id   = stem[10:]
+    elif stem.startswith("detachment_rule_"):
+        category = "Detachment_Rule"
+        doc_id   = stem[16:]
     elif stem.startswith("core_rules_"):
         category = "Core_Rules"
         doc_id   = stem[11:]
@@ -125,7 +131,7 @@ def extract_metadata(filepath, content, edition_code="10e"):
     first_line = content.splitlines()[0] if content else ""
     if first_line.startswith("# "):
         unit_name = first_line[2:].strip()
-        for pfx in ("Stratagem: ", "Enhancement: "):
+        for pfx in ("Stratagem: ", "Enhancement: ", "Army Rule: ", "Detachment Rule: "):
             if unit_name.startswith(pfx):
                 unit_name = unit_name[len(pfx):]
                 break
@@ -601,6 +607,67 @@ def verify_after_ingest(edition="10e", recall=True, strict=False):
     return rc
 
 
+# ── Collection reconciliation (orphan prune) ───────────────────────────────────
+
+def derive_valid_ids(md_files, edition):
+    """The exact set of chunk-ids the CURRENT corpus should produce.
+
+    Mirrors ingest_files: pass-1 expansion for every file, plus the pass-2/3
+    ability/section fan-out for unit_ files. Used to find vectors in the collection
+    that no longer correspond to any current rule block.
+    """
+    valid_chunks  = set()
+    valid_parents = set()
+    for fp in md_files:
+        content   = fp.read_text(encoding="utf-8")
+        base_meta = extract_metadata(fp, content, edition)
+        valid_parents.add(base_meta["doc_id"])
+        for cid, _doc, _meta in expand_file_to_chunks(fp, content, base_meta, edition):
+            valid_chunks.add(cid)
+        if fp.stem.startswith("unit_"):
+            for cid, _d, _m in extract_abilities(content, base_meta):
+                valid_chunks.add(cid)
+            for cid, _d, _m in extract_sections(content, base_meta):
+                valid_chunks.add(cid)
+    return valid_chunks, valid_parents
+
+
+def reconcile_collection(collection, md_files, ingest_manifest, edition):
+    """Delete embeddings (and manifest entries) that the current corpus no longer
+    produces — deprecated/renumbered datasheets, removed rule sections, and
+    content-shrink sub-chunks. This is the only thing that prunes the collection
+    short of a full --reset; ingest is otherwise upsert-only.
+
+    Safety floor: if the orphan set is implausibly large (>40% of the collection),
+    something is wrong upstream (empty/incomplete corpus, wrong edition) — refuse
+    to delete rather than gut the DB on a bad run.
+    """
+    valid_chunks, valid_parents = derive_valid_ids(md_files, edition)
+    live = set(collection.get(include=[])["ids"])
+    orphans = live - valid_chunks
+    if not orphans:
+        print("  Reconcile: 0 orphan chunks (collection matches corpus).")
+        return 0
+    if len(orphans) > 0.40 * max(len(live), 1):
+        print(f"  [reconcile] ABORTED — {len(orphans)}/{len(live)} chunks would be "
+              f"deleted (>40%); refusing in case the corpus is incomplete. "
+              f"Run with --reset for an intentional full rebuild.", file=sys.stderr)
+        return 0
+
+    ids = list(orphans)
+    for i in range(0, len(ids), BATCH_SIZE):
+        collection.delete(ids=ids[i:i + BATCH_SIZE])
+
+    # Prune stale manifest entries so it doesn't grow without bound either.
+    for k in [k for k in ingest_manifest
+              if k not in valid_chunks
+              and not (k.startswith("_parent_") and k[len("_parent_"):] in valid_parents)]:
+        ingest_manifest.pop(k, None)
+
+    print(f"  Reconcile: deleted {len(orphans)} orphan chunk(s) from the collection.")
+    return len(orphans)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(reset=False, edition="10e", verify=True, verify_recall=True, strict_verify=False):
@@ -627,6 +694,11 @@ def run(reset=False, edition="10e", verify=True, verify_recall=True, strict_veri
     p1_up, p1_sk, p2_up, p2_sk, p3_up, p3_sk = ingest_files(
         collection, md_files, ingest_manifest, reset=reset, edition=edition
     )
+
+    # Prune embeddings the current corpus no longer produces. A fresh --reset build
+    # is already in sync, so only reconcile on incremental runs.
+    if not reset:
+        reconcile_collection(collection, md_files, ingest_manifest, edition)
 
     save_ingest_manifest(manifest_path, ingest_manifest)
 

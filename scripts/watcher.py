@@ -54,6 +54,8 @@ CSV_FILES = [
     "Abilities.csv",
     "Stratagems.csv",
     "Enhancements.csv",
+    "Detachment_abilities.csv",
+    "Detachments.csv",
     "Factions.csv",
     "Source.csv",
     "Last_update.csv",

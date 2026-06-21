@@ -694,6 +694,12 @@ def process_query(query: str, edition: str, mission_pack_mode: bool = True):
 
     # NOTE: isolation comes from the per-edition collection, NOT from a `where`
     # filter on edition — do not add {"edition": ...} here (see architecture §2).
+    # Army/detachment rules are NOT scoped here — they reach context via the
+    # name-gated retrieve_named_rules slice (folded into retrieve_rules_slice), which
+    # mirrors the unit slice: a faction/detachment rule the query NAMES is reserved,
+    # so it survives budget truncation without weakly-matched rules ballooning
+    # unrelated questions (the cross-encoder saturates ~1.0 on off-topic rules, so a
+    # name gate — not a rerank threshold — is the clean discriminator).
     if mission_pack_mode:
         if faction and not include_core:
             where = {"$or": [{"army": faction}, {"category": mp_category}]}
@@ -826,7 +832,45 @@ def retrieve_rules_slice(query: str, edition: str, mission_pack_mode: bool,
     # Defensive: retrieve() silently drops its where-filter on error, so
     # re-assert the category allow-list here — this is what guarantees a
     # mission-pack chunk can never leak in while the toggle is off.
-    return [c for c in chunks if c["metadata"].get("category") in allowed]
+    sliced = [c for c in chunks if c["metadata"].get("category") in allowed]
+    # Name-gated army/detachment rules ride the guaranteed rules slice (reserved by
+    # assemble_context), so a NAMED faction/detachment rule survives budget truncation.
+    return sliced + retrieve_named_rules(query, edition)
+
+
+# Title prefixes the ETL gives the two faction-rule block types.
+_RULE_TITLE_RE   = re.compile(r"^#\s*(?:Army|Detachment)\s+Rule:\s*(.+?)\s*$")
+_RULE_DETACH_RE  = re.compile(r"\*\*Detachment:\*\*\s*([^|]+)")
+
+def retrieve_named_rules(query: str, edition: str) -> list[dict]:
+    """Guaranteed candidacy for an Army_Rule / Detachment_Rule the query NAMES — by
+    rule name (e.g. "Oath of Moment", "Armoured Wrath") or detachment name (e.g.
+    "Ironstorm Spearhead"). A metadata fetch + lexical gate, NOT semantic: the
+    cross-encoder saturates ~1.0 on off-topic rules, so a rerank threshold can't
+    separate them — but an unrelated query won't NAME a specific rule. Mirrors the
+    unit slice. See spec/army-detachment-rules.md."""
+    q = (query or "").lower()
+    coll = get_collection(edition)
+    try:
+        got = coll.get(
+            where={"$or": [{"category": "Army_Rule"}, {"category": "Detachment_Rule"}]},
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return []
+    hits = []
+    for doc, meta in zip(got.get("documents", []), got.get("metadatas", [])):
+        lines = doc.splitlines()
+        m_name   = _RULE_TITLE_RE.match(lines[0]) if lines else None
+        name     = m_name.group(1).strip().lower() if m_name else ""
+        m_detach = next((_RULE_DETACH_RE.search(l) for l in lines[:3]
+                         if _RULE_DETACH_RE.search(l)), None)
+        detach   = m_detach.group(1).strip().lower() if m_detach else ""
+        if (len(name) >= 4 and name in q) or (len(detach) >= 5 and detach in q):
+            # similarity 0.0 (not None) so boosted_score works pre-rerank — same
+            # degraded-cosine convention the unit slice uses.
+            hits.append({"text": doc, "metadata": meta, "similarity": 0.0})
+    return hits
 
 # ── Guaranteed unit slice (datasheet candidacy for unit-named queries) ─────────
 
@@ -1218,6 +1262,21 @@ def _reserve_unit_chunks(unit_chunks: list, reserved_keys: set, rank) -> list:
         keep.extend(chosen)
     return keep
 
+def _tier_unit_chunks(units_keep: list, rank) -> tuple[list, list]:
+    """Split the per-unit reservation into (firsts, seconds): each named unit's single
+    best chunk goes to `firsts`, every other reserved chunk of that unit to `seconds`.
+    Lets assemble_context protect one chunk per unit ahead of any unit's extras, so the
+    token budget can't drop a unit's only representation while keeping another's 2nd."""
+    by_unit: dict = {}
+    for c in units_keep:
+        by_unit.setdefault(c["metadata"].get("unit_name"), []).append(c)
+    firsts, seconds = [], []
+    for chunks in by_unit.values():
+        ranked = sorted(chunks, key=rank, reverse=True)
+        firsts.append(ranked[0])
+        seconds.extend(ranked[1:])
+    return firsts, seconds
+
 def assemble_context(main_chunks: list, rules_chunks: list, edition: str,
                      mission_pack_mode: bool, unit_chunks: list | None = None) -> list:
     """
@@ -1267,7 +1326,22 @@ def assemble_context(main_chunks: list, rules_chunks: list, edition: str,
     capped_units = {c["metadata"].get("unit_name") for c in units_keep
                     if c["metadata"].get("unit_name")}
 
-    reserved   = sorted(guaranteed + units_keep, key=rank, reverse=True)
+    # Tier the reservation so a multi-unit question can't let one unit box another
+    # out: every named unit's BEST chunk (+ the guaranteed rules) rides the protected
+    # front tier, and each unit's SECOND chunk rides a back tier. format_rules_context
+    # fills in this order and drops whole chunks past the budget, so the sacrifice is a
+    # unit's secondary detail (Abaddon's Dark Pacts) — never another unit's only chunk
+    # (Aberrants' Feel No Pain, which the cross-encoder rates ~0 and would otherwise
+    # sort dead last). Within each tier, order by rank.
+    # Order: each named unit's BEST chunk FIRST (the unit slice exists because these
+    # chunks rank ~0 under the cross-encoder, so ranking them against the rules would
+    # bury them), then the guaranteed rules, then each unit's SECOND chunk. The budget
+    # therefore sacrifices a unit's secondary detail / a low rule before any named
+    # unit's only representation — no unit boxes another out of context.
+    unit_firsts, unit_seconds = _tier_unit_chunks(units_keep, rank)
+    reserved   = (sorted(unit_firsts,   key=rank, reverse=True)
+                  + sorted(guaranteed,    key=rank, reverse=True)
+                  + sorted(unit_seconds,  key=rank, reverse=True))
     rest_slots = max(0, config.TOP_K - len(reserved))         # target TOP_K, not a cap
     main_sorted = sorted(deduplicate_chunks(main_chunks), key=rank, reverse=True)
     rest = [c for c in main_sorted
