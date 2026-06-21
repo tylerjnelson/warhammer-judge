@@ -26,6 +26,13 @@ def check(cond, msg):
     if not cond:
         fails.append(msg)
 
+def core(resolved):
+    """Project resolutions to their semantic fields, dropping the occurrence-slot
+    bookkeeping (slot_id/start/end) the queue now carries for multi-occurrence
+    rewriting — so equality assertions stay about (ref, unit_name, army)."""
+    return [{"ref": r["ref"], "unit_name": r["unit_name"], "army": r["army"]}
+            for r in resolved]
+
 def drive(query, pick, sidebar=None, max_rounds=12):
     """Build the queue, then resolve every pending unit by calling `pick` for each
     question. `pick(kind, ref, army, choices) -> choice` simulates a button click;
@@ -79,7 +86,7 @@ st = drive("my unit is in a land raider, can it charge",
            picker(["Adeptus Custodes"]))
 check(st is not None, "chassis word triggers clarification")
 if st:
-    check(st["resolved"] == [{"ref": "Land Raider",
+    check(core(st["resolved"]) == [{"ref": "Land Raider",
                               "unit_name": "Venerable Land Raider",
                               "army": "Adeptus Custodes"}],
           "Custodes → auto-resolved to Venerable Land Raider (one round only)")
@@ -96,7 +103,7 @@ check(kind == "faction" and "Adeptus Custodes" in armies
 print("\n--- Case 2: chassis word, multi-variant faction prompts a variant round ---")
 st = drive("land raider transport capacity",
            picker(["Space Marines", "Land Raider Crusader"]))
-check(st is not None and st["resolved"] ==
+check(st is not None and core(st["resolved"]) ==
       [{"ref": "Land Raider", "unit_name": "Land Raider Crusader",
         "army": "Space Marines"}],
       "SM → variant round → resolved to the chosen Land Raider Crusader")
@@ -105,7 +112,7 @@ check(st is not None and st["resolved"] ==
 print("\n--- Case 3: faction in query → variant round only (skips faction) ---")
 st = drive("Space Marines land raider transport", picker(["Land Raider Redeemer"]))
 check(st is not None and st["units"] == []
-      and st["resolved"] == [{"ref": "Land Raider",
+      and core(st["resolved"]) == [{"ref": "Land Raider",
                               "unit_name": "Land Raider Redeemer",
                               "army": "Space Marines"}],
       "in-query faction skips to variant round, resolves to the pick")
@@ -114,7 +121,7 @@ check(st is not None and st["units"] == []
 print("\n--- Case 4: sidebar faction with a unique variant (no prompt) ---")
 st = drive("land raider", picker([]), sidebar="Adeptus Custodes")
 check(st is not None and st["units"] == []
-      and st["resolved"] == [{"ref": "Land Raider",
+      and core(st["resolved"]) == [{"ref": "Land Raider",
                               "unit_name": "Venerable Land Raider",
                               "army": "Adeptus Custodes"}],
       "sidebar Custodes auto-resolves to Venerable Land Raider, no buttons")
@@ -122,7 +129,7 @@ check(st is not None and st["units"] == []
 # 5) Sidebar faction with MANY variants → variant round only.
 print("\n--- Case 5: sidebar faction with many variants → variant round ---")
 st = drive("land raider", picker(["Land Raider Excelsior"]), sidebar="Space Marines")
-check(st is not None and st["resolved"] ==
+check(st is not None and core(st["resolved"]) ==
       [{"ref": "Land Raider", "unit_name": "Land Raider Excelsior",
         "army": "Space Marines"}],
       "sidebar SM prompts which variant, resolves to the pick")
@@ -130,7 +137,7 @@ check(st is not None and st["resolved"] ==
 # 6) A specific variant NAME (leaf) that several factions field → faction round only.
 print("\n--- Case 6: leaf datasheet, multi-faction → faction round only ---")
 st = drive("Land Raider Crusader rules", picker(["Grey Knights"]))
-check(st is not None and st["resolved"] ==
+check(st is not None and core(st["resolved"]) ==
       [{"ref": "Land Raider Crusader", "unit_name": "Land Raider Crusader",
         "army": "Grey Knights"}],
       "leaf multi-faction unit asks faction once, resolves (no variant round)")
@@ -171,6 +178,47 @@ if state:
           "original units list untouched after apply (new state returned)")
 else:
     fails.append("Case 10 setup: expected ambiguity for land raider + rhino")
+
+# 11) MIRROR: the same chassis named TWICE for two DIFFERENT factions. Each occurrence
+#     gets its own prompt/resolution; both survive (the original bug dropped the 2nd),
+#     and the inline rewrite replaces BOTH mentions with their distinct (unit, army).
+print("\n--- Case 11: same chassis twice, two factions (multi-occurrence) ---")
+MIRROR = "a custodes land raider vs a chaos land raider"
+st = drive(MIRROR, picker(["Adeptus Custodes", "Thousand Sons"]))
+if st is not None:
+    res = st["resolved"]
+    check(len(res) == 2, f"two independent resolutions (got {len(res)})")
+    check({r["army"] for r in res} == {"Adeptus Custodes", "Thousand Sons"},
+          f"distinct armies resolved ({sorted(r['army'] for r in res)})")
+    check(len({(r["start"], r["end"]) for r in res}) == 2,
+          "the two resolutions carry distinct occurrence spans")
+    rewrite = app.apply_resolution_to_query(MIRROR, res)
+    print(f"   rewrite: {rewrite!r}")
+    check(rewrite.count("(Adeptus Custodes)") == 1
+          and rewrite.count("(Thousand Sons)") == 1,
+          "inline rewrite replaces BOTH occurrences with their own (unit, army)")
+    check(rewrite.lower().count("land raider") == 2,
+          "no leftover bare chassis word (both occurrences consumed)")
+else:
+    fails.append("Case 11: expected clarification for the mirror query")
+
+# 12) Same chassis twice, SAME faction → two slots, two (redundant but correct)
+#     resolutions; the rewrite still replaces both occurrences.
+print("\n--- Case 12: same chassis twice, same faction (redundant but correct) ---")
+TWICE = "a land raider escorts another land raider"
+st = drive(TWICE, picker(["Adeptus Custodes", "Adeptus Custodes"]))
+if st is not None:
+    res = st["resolved"]
+    check(len(res) == 2 and all(r["army"] == "Adeptus Custodes" for r in res),
+          f"both occurrences resolved to Custodes (got {core(res)})")
+    check(len({(r["start"], r["end"]) for r in res}) == 2,
+          "distinct spans even though same (unit, army)")
+    rewrite = app.apply_resolution_to_query(TWICE, res)
+    print(f"   rewrite: {rewrite!r}")
+    check(rewrite.count("Venerable Land Raider (Adeptus Custodes)") == 2,
+          "inline rewrite replaces both occurrences")
+else:
+    fails.append("Case 12: expected clarification for the same-faction-twice query")
 
 print("\n" + "=" * 70)
 print(f"{'ALL PASS' if not fails else f'{len(fails)} FAILURE(S)'}")

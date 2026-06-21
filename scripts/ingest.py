@@ -86,7 +86,12 @@ def content_hash(text: str) -> str:
 
 # ── Metadata extraction ───────────────────────────────────────────────────────
 
-HEADER_RE = re.compile(r'\*\*Faction:\*\*\s*([^|]+?)\s*\|.*\*\*Source:\*\*\s*(\S+)')
+# Faction and Source are captured independently: unit blocks carry both on the
+# header line, but Army_Rule/Detachment_Rule blocks carry **Faction:** with no
+# **Source:** token. Requiring them together (the old combined regex) dropped the
+# faction on rule chunks, leaving army=''. See spec/multi-unit-clarification-and-faction-scope.md (P3).
+FACTION_RE = re.compile(r'\*\*Faction:\*\*\s*([^|]+?)\s*(?:\||$)')
+SOURCE_RE  = re.compile(r'\*\*Source:\*\*\s*(\S+)')
 ERRATA_RE = re.compile(r'\*\(errata\)\*')
 
 def extract_metadata(filepath, content, edition_code="10e"):
@@ -121,10 +126,15 @@ def extract_metadata(filepath, content, edition_code="10e"):
     army      = ""
     source_id = ""
     for line in content.splitlines()[:6]:
-        m = HEADER_RE.search(line)
-        if m:
-            army      = m.group(1).strip()
-            source_id = m.group(2).strip()
+        if not army:
+            mf = FACTION_RE.search(line)
+            if mf:
+                army = mf.group(1).strip()
+        if not source_id:
+            ms = SOURCE_RE.search(line)
+            if ms:
+                source_id = ms.group(1).strip()
+        if army and source_id:
             break
 
     unit_name  = ""

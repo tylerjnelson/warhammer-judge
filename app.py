@@ -483,6 +483,43 @@ def resolve_named_units(query: str, edition: str) -> list[str]:
     return sorted(n for n in found
                   if not any(n != m and n.lower() in m.lower() for m in found))
 
+def find_unit_occurrences(query: str, edition: str) -> list[dict]:
+    """Ordered occurrence SLOTS for the datasheet name(s) a query mentions, with
+    positions and multiplicity preserved — unlike resolve_named_units, which returns a
+    deduped set and loses the fact that the same chassis word can appear twice (the
+    multi-occurrence case that this enables clarifying independently).
+
+    Longest-match, left-to-right, consuming matched spans, so 'Land Raider' INSIDE
+    'Land Raider Crusader' (or 'Chaos Land Raider') is not double-counted — the same
+    substring-suppression intent as resolve_named_units, but applied per-occurrence
+    instead of globally, so two genuinely separate mentions both survive.
+
+    Returns [{id, ref, start, end}, ...] sorted by start; the same `ref` may appear in
+    several slots. `id` is a stable per-query slot ordinal (keys the queue + buttons)."""
+    names, token_to_name = get_unit_name_resolver(edition)
+    q = query.lower()
+    spans = []  # (start, end, ref)
+    for nm in names:                                   # full-name occurrences
+        low = nm.lower()
+        start = q.find(low)
+        while start != -1:
+            spans.append((start, start + len(low), nm))
+            start = q.find(low, start + 1)
+    for t, nm in token_to_name.items():                # distinctive single tokens
+        for m in re.finditer(rf"\b{re.escape(t)}\b", q):
+            spans.append((m.start(), m.end(), nm))
+    # Greedy: earliest start first, longest span at a tie; skip anything that overlaps
+    # an already-claimed span (suppresses the shorter substring at the same position).
+    spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+    slots, consumed_end, sid = [], -1, 0
+    for s, e, ref in spans:
+        if s < consumed_end:
+            continue
+        slots.append({"id": sid, "ref": ref, "start": s, "end": e})
+        consumed_end = e
+        sid += 1
+    return slots
+
 def unit_armies(unit_name: str, edition: str) -> list[str]:
     """Distinct armies a datasheet name appears under — the faction-ambiguity axis."""
     collection = get_collection(edition)
@@ -590,7 +627,11 @@ def build_clarification_queue(query: str, edition: str,
 
     names, _ = get_unit_name_resolver(edition)
     units, resolved = [], []
-    for ref in resolve_named_units(query, edition):
+    # Iterate per OCCURRENCE (slot), not per unique name, so the same chassis mentioned
+    # twice gets two independent prompts/resolutions. Each slot carries its id+span so
+    # highlight targets the right word and the rewrite is offset-shift-immune.
+    for slot in find_unit_occurrences(query, edition):
+        ref = slot["ref"]
         # Only chassis bases or multi-faction leaves are ambiguous; a single-faction
         # leaf needs no prompt (retrieve_unit_slice derives its sole army).
         if not is_chassis_base(ref, names) and len(unit_armies(ref, edition)) <= 1:
@@ -599,10 +640,11 @@ def build_clarification_queue(query: str, edition: str,
         if not family:
             continue
         kind, payload = _new_unit_state(ref, family, pinned)
+        slot_fields = {"slot_id": slot["id"], "start": slot["start"], "end": slot["end"]}
         if kind == "ask":
-            units.append(payload)
+            units.append({**payload, **slot_fields})
         elif kind == "auto":
-            resolved.append(payload)
+            resolved.append({**payload, **slot_fields})
     if not units and not resolved:
         return None
     return {"query": query, "units": units, "resolved": resolved}
@@ -626,41 +668,59 @@ def apply_clarification(state: dict, choice: str) -> dict:
     units = [dict(u) for u in state["units"]]
     resolved = list(state["resolved"])
     u = units[0]
+    # Carry the occurrence slot (id + span) onto the resolution so the inline rewrite
+    # and unit slice can target the exact mention this pick was for.
+    slot = {k: u[k] for k in ("slot_id", "start", "end") if k in u}
     if u["stage"] == "faction":
         variants = u["family"][choice]
         if len(variants) == 1:
-            resolved.append({"ref": u["ref"], "unit_name": variants[0], "army": choice})
+            resolved.append({"ref": u["ref"], "unit_name": variants[0], "army": choice, **slot})
             units.pop(0)
         else:
             u["army"], u["stage"] = choice, "variant"
     else:  # variant stage
-        resolved.append({"ref": u["ref"], "unit_name": choice, "army": u["army"]})
+        resolved.append({"ref": u["ref"], "unit_name": choice, "army": u["army"], **slot})
         units.pop(0)
     return {**state, "units": units, "resolved": resolved}
 
-def highlight_ref(query: str, ref: str) -> str:
-    """Mark the unit reference inside the query (first occurrence, case-insensitive)
-    so the user can see WHICH word the clarification buttons are about."""
+def highlight_ref(query: str, ref: str, start: int | None = None,
+                  end: int | None = None) -> str:
+    """Mark the unit reference inside the query so the user sees WHICH word the
+    clarification buttons are about. When the occurrence's span (start/end) is given,
+    bold exactly THAT occurrence (so the second 'Land Raider' highlights on its own
+    prompt); otherwise fall back to the first case-insensitive match of `ref`."""
+    if start is not None and end is not None:
+        return f"{query[:start]}**:blue[{query[start:end]}]**{query[end:]}"
     return re.sub(re.escape(ref), lambda m: f"**:blue[{m.group(0)}]**",
                   query, count=1, flags=re.IGNORECASE)
 
 def apply_resolution_to_query(query: str, resolved: list) -> str:
-    """Rewrite the query INLINE — replace each chassis reference where it sits with
-    the specific resolved datasheet + faction — rather than appending a trailing
+    """Rewrite the query INLINE — replace each resolved chassis OCCURRENCE where it sits
+    with the specific resolved datasheet + faction — rather than appending a trailing
     "specifically the …" (which leaves the generic word in place and over-weights the
-    unit's own datasheet chunks at rerank). Each ref's first occurrence is replaced
-    once, in resolution order.
+    unit's own datasheet chunks at rerank).
 
-    NOTE: refs are keyed by datasheet NAME, so the same chassis named TWICE for two
-    different factions in one query ('a Custodes Land Raider vs a Chaos Land Raider')
-    still collapses to a single resolution — a true mirror needs per-occurrence
-    resolution (a known limitation, tracked separately)."""
-    out = query
-    for r in resolved:
-        out = re.sub(re.escape(r["ref"]),
-                     f'{r["unit_name"]} ({r["army"]})',
-                     out, count=1, flags=re.IGNORECASE)
-    return out
+    Offset-shift-immune: occurrences are keyed by their span (start/end) in the
+    ORIGINAL string and the result is rebuilt in a single forward pass that only ever
+    READS the original — so replacing one occurrence never invalidates a later one's
+    span (the failure mode of count=1 replace-one-at-a-time). This is what makes the
+    mirror case work: 'a Custodes Land Raider vs a Chaos Land Raider' rewrites BOTH
+    mentions to their distinct (unit, army) pairs."""
+    spanned = sorted((r for r in resolved if r.get("start") is not None
+                      and r.get("end") is not None), key=lambda r: r["start"])
+    if not spanned:                                    # legacy/no-span: name-based fallback
+        out = query
+        for r in resolved:
+            out = re.sub(re.escape(r["ref"]), f'{r["unit_name"]} ({r["army"]})',
+                         out, count=1, flags=re.IGNORECASE)
+        return out
+    out, prev = [], 0
+    for r in spanned:
+        out.append(query[prev:r["start"]])
+        out.append(f'{r["unit_name"]} ({r["army"]})')
+        prev = r["end"]
+    out.append(query[prev:])
+    return "".join(out)
 
 def expand_query(query: str) -> str:
     q = query
@@ -875,6 +935,37 @@ def retrieve_named_rules(query: str, edition: str) -> list[dict]:
 # ── Guaranteed unit slice (datasheet candidacy for unit-named queries) ─────────
 
 UNIT_SLICE_CATEGORIES = ("Datasheet", "Ability", "Datasheet_Section")
+
+# Categories whose `army` metadata pins a chunk to a faction. Everything else
+# (Core_Rules and the per-edition mission pack — incl. 11e's differently-named
+# pack) is faction-agnostic and always kept. Inverting to an allowlist (rather
+# than a denylist of agnostic categories) keeps the filter pure: no `edition`
+# argument is needed to compute the mission-pack category name. Add any NEW
+# faction-bearing category here. See spec/multi-unit-clarification-and-faction-scope.md (P2).
+FACTION_SCOPED_CATEGORIES = set(UNIT_SLICE_CATEGORIES) | {"Army_Rule", "Detachment_Rule"}
+
+def scope_to_resolved_armies(chunks: list[dict], resolved_armies: set) -> list[dict]:
+    """Drop faction-bearing chunks whose faction isn't in `resolved_armies`; keep
+    faction-agnostic chunks (Core_Rules, mission-pack) and anything not faction-
+    scoped. No-op when `resolved_armies` is empty. Pure — no edition/config
+    dependency. Army_Rule `army` may be a comma-joined multi-faction list
+    (allied rules share an id), so membership is tested against the split set.
+
+    A faction-bearing chunk with empty `army` yields an empty set → dropped; after
+    P3 every unit/rule chunk has a populated `army`, so this only bites if P3 didn't
+    land — the strict drop is the safe direction (never re-admit an unscoped chunk)."""
+    if not resolved_armies:
+        return chunks
+    out = []
+    for c in chunks:
+        if c["metadata"].get("category", "") not in FACTION_SCOPED_CATEGORIES:
+            out.append(c)                                   # agnostic → always keep
+            continue
+        army   = c["metadata"].get("army", "") or ""
+        armies = {s.strip() for s in army.split(",") if s.strip()}
+        if armies & resolved_armies:
+            out.append(c)
+    return out
 
 def retrieve_unit_slice(query: str, edition: str, mission_pack_mode: bool,
                         resolution: list | dict | None = None) -> list[dict]:
@@ -1711,19 +1802,22 @@ def render_clarification_buttons(state: dict) -> None:
     if nxt is None:
         return
     query = state["query"]
+    active = state["units"][0]                 # the slot this question is about
     if nxt[0] == "faction":
         _, ref, choices = nxt
         st.markdown(f"Which **army** fields this unit?")
     else:
         _, ref, army, choices = nxt
         st.markdown(f"Which **{ref}** — _{army}_?")
-    st.markdown("> " + highlight_ref(query, ref))
+    st.markdown("> " + highlight_ref(query, ref, active.get("start"), active.get("end")))
+    # Slot id keys the buttons so the SAME chassis prompted twice doesn't collide.
+    slot_id = active.get("slot_id", 0)
     # Fixed 3-wide grid + full-width buttons → uniform sizing (no awkward gaps).
     for row_start in range(0, len(choices), 3):
         row = choices[row_start:row_start + 3]
         cols = st.columns(3)
         for col, choice in zip(cols, row):
-            if col.button(choice, key=f"clarify_{nxt[0]}_{ref}_{choice}",
+            if col.button(choice, key=f"clarify_{nxt[0]}_{slot_id}_{ref}_{choice}",
                           use_container_width=True):
                 st.session_state.pending_clarification = apply_clarification(state, choice)
                 st.rerun()
@@ -1857,6 +1951,17 @@ def render_chat():
         mission_pack_mode=st.session_state.mission_pack_mode,
         n_results=config.TOP_K_RULES * 2,
     )
+
+    # P2: once clarification has resolved the named unit(s) to a faction set, scope
+    # the broad candidate pools to those armies BEFORE the TOP_K cap, so a different
+    # faction's same-named unit/rule (the Custodes-vs-Chaos Land Raider leak) is
+    # dropped and the freed slots backfill with relevant same-faction/agnostic chunks.
+    # No-op when nothing resolved. unit_raw is already resolution-scoped by construction.
+    resolved_armies = {r["army"] for r in (resolution if isinstance(resolution, list) else [])
+                       if r.get("army")}
+    if resolved_armies:
+        chunks_raw = scope_to_resolved_armies(chunks_raw, resolved_armies)
+        rules_raw  = scope_to_resolved_armies(rules_raw,  resolved_armies)
 
     # Layer 3. Order: SEED the rules a surfaced chunk depends on into the pool — the
     # definitions a rule references (seed_definitions) and the core/mission-pack rules
