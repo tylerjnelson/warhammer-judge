@@ -338,3 +338,71 @@ def active_editions() -> list[str]:
 def default_edition() -> str:
     """Return the single edition code whose 'default' is True."""
     return next(c for c, e in EDITIONS.items() if e["default"])
+
+
+# ── Retrieval-knob interaction map + boot invariants (C14) ────────────────────
+# The ~30 retrieval knobs above are individually justified but collectively tuned to
+# one eval set, and their INTERACTIONS lived nowhere central. This is that central
+# place. Grouped by pipeline STAGE (which knob affects which stage, and which knobs
+# pull against each other):
+#
+#   ROUTING (process_query / is_core_rules_query)
+#       — no numeric knobs; the where-clause truth table is in app.process_query.
+#   RETRIEVAL (retrieve / lexical_search)
+#       SIMILARITY_THRESHOLD ↓ widens the dense pool the reranker sorts; too low =
+#         more noise for rerank to suppress. RERANK_CANDIDATES is that pool's size.
+#       HYBRID_LEXICAL · LEXICAL_* gate the BM25 augmentation: LEXICAL_MIN_OVERLAP ↑
+#         and [LEXICAL_SIM_FLOOR, LEXICAL_SIM_CEIL] together decide how aggressively a
+#         lexical-only hit is injected and how high it can sort.
+#   SEEDING (seed_definitions / seed_referenced_rules / rank_seeded_below_parents)
+#       SPAN_GATE_MIN gates definition seeds; REFERENCED_PARENT_MIN gates ability→rule
+#         seeds. RULES_BOOST_DEP + DEP_SCORE_EPS set how far BELOW its parent a seeded
+#         dep rides (must stay > 0 so a dep never out-ranks its parent).
+#         DEP_BOOST_MAX_PER_QUERY bounds blast radius.
+#   RERANK (rerank_pools / boosted_score)
+#       RERANK_COSINE_FLOOR (W) blends cosine UNDER the cross-encoder; must be < 1 so a
+#         blended cosine can't leapfrog a genuinely reranked chunk. Segment-maxpool:
+#         RERANK_SEGMENT_MAX clauses + RERANK_SEGMENT_TIEBREAK (whole-query weight).
+#       AUTHORITY_TIEBREAK is a pure ~0.001 mission-pack>core ordering term — must stay
+#         tiny so it never overpowers relevance.
+#   RESERVATION (assemble_context)
+#       TOP_K is the soft target; TOP_K_RULES reserves rule slots (must be < TOP_K).
+#       UNIT_CHUNKS_PER_UNIT chunks per named unit; the 2nd is kept only if within
+#         UNIT_SECOND_RATIO of the unit's best AND that best ≥ UNIT_SECOND_FLOOR
+#         (FLOOR ≤ RATIO by construction). REST_GATE floors discretionary fill.
+#   SERVING (format_rules_context / build_messages / call_llm)
+#       RULES_CONTEXT_TOKEN_BUDGET is the SOFT hard-ceiling; MAX_HISTORY_MESSAGES +
+#         MAX_OUTPUT_TOKENS + the 6K/min TPM ceiling bound per-call cost.
+
+def assert_invariants() -> None:
+    """Codify the relationships the tuning relies on, so a nudge that breaks an assumed
+    invariant fails LOUDLY at boot instead of silently degrading retrieval. Called once
+    at startup (app.init_session). Pure: no I/O, no model load."""
+    inv = [
+        ("0 <= RERANK_COSINE_FLOOR < 1",      0 <= RERANK_COSINE_FLOOR < 1),
+        ("TOP_K_RULES < TOP_K",                TOP_K_RULES < TOP_K),
+        ("UNIT_CHUNKS_PER_UNIT >= 1",          UNIT_CHUNKS_PER_UNIT >= 1),
+        ("0 <= UNIT_SECOND_RATIO <= 1",        0 <= UNIT_SECOND_RATIO <= 1),
+        ("0 <= UNIT_SECOND_FLOOR <= 1",        0 <= UNIT_SECOND_FLOOR <= 1),
+        ("UNIT_SECOND_FLOOR <= UNIT_SECOND_RATIO (else the floor never bites)",
+                                               UNIT_SECOND_FLOOR <= UNIT_SECOND_RATIO),
+        ("0 < SPAN_GATE_MIN < 1",              0 < SPAN_GATE_MIN < 1),
+        ("0 < REFERENCED_PARENT_MIN < 1",      0 < REFERENCED_PARENT_MIN < 1),
+        ("RULES_BOOST_DEP > 0 (a dep must ride strictly below its parent)",
+                                               RULES_BOOST_DEP > 0),
+        ("DEP_SCORE_EPS >= 0",                 DEP_SCORE_EPS >= 0),
+        ("DEP_BOOST_MAX_PER_QUERY >= 1",       DEP_BOOST_MAX_PER_QUERY >= 1),
+        ("RERANK_CANDIDATES >= TOP_K",         RERANK_CANDIDATES >= TOP_K),
+        ("RERANK_SEGMENT_MAX >= 1",            RERANK_SEGMENT_MAX >= 1),
+        ("0 <= RERANK_SEGMENT_TIEBREAK < 1",   0 <= RERANK_SEGMENT_TIEBREAK < 1),
+        ("AUTHORITY_TIEBREAK >= 0 and small",  0 <= AUTHORITY_TIEBREAK < 0.05),
+        ("0 <= LEXICAL_MIN_OVERLAP <= 1",      0 <= LEXICAL_MIN_OVERLAP <= 1),
+        ("LEXICAL_SIM_FLOOR <= LEXICAL_SIM_CEIL", LEXICAL_SIM_FLOOR <= LEXICAL_SIM_CEIL),
+        ("REST_GATE >= 0",                     REST_GATE >= 0),
+        ("0 < SIMILARITY_THRESHOLD < 1",       0 < SIMILARITY_THRESHOLD < 1),
+        ("exactly one default edition",        sum(1 for e in EDITIONS.values() if e["default"]) == 1),
+        ("active editions ⊇ {default}",        EDITIONS[default_edition()]["active"]),
+    ]
+    broken = [name for name, ok in inv if not ok]
+    if broken:
+        raise AssertionError("config.assert_invariants violated: " + "; ".join(broken))
