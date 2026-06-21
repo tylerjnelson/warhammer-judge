@@ -55,6 +55,8 @@ def load_csvs(csv_dir):
         "abilities":    "Abilities.csv",
         "stratagems":   "Stratagems.csv",
         "enhancements": "Enhancements.csv",
+        "detachment_abilities": "Detachment_abilities.csv",
+        "detachments":  "Detachments.csv",
         "factions":     "Factions.csv",
         "source":       "Source.csv",
     }
@@ -107,10 +109,21 @@ def safe(val, fallback="—"):
     return str(val).strip()
 
 def strip_html(text):
-    """Strip HTML tags and normalise whitespace for clean LLM context."""
+    """Strip HTML tags and normalise whitespace for clean LLM context.
+
+    List structure is preserved before tags are removed: Wahapedia encodes
+    multi-option wargear and named-model rosters as "<ul><li>A</li><li>B</li></ul>".
+    A blind tag-strip mashes those into "A B C" (one ambiguous blob), so we first
+    turn each list item / line break into a readable separator — "A, B, C".
+    """
     if not text or text == "—":
         return text
-    # Remove HTML tags
+    # Preserve list/line structure BEFORE the blanket tag strip below.
+    text = re.sub(r'<li[^>]*>', '', text)          # item start  -> (nothing)
+    text = re.sub(r'\s*</li\s*>', ', ', text)       # item end    -> ", "
+    text = re.sub(r'\s*<br\s*/?>', ' ', text)       # line break  -> " "
+    text = re.sub(r'\s*</?ul[^>]*>', ' ', text)     # list wrapper-> " "
+    # Remove remaining HTML tags
     text = re.sub(r'<[^>]+>', ' ', text)
     # Decode common HTML entities
     text = (text
@@ -120,8 +133,16 @@ def strip_html(text):
             .replace('&nbsp;', ' ')
             .replace('&#39;',  "'")
             .replace('&quot;', '"'))
-    # Collapse whitespace
+    # Collapse whitespace, then tidy the separators the list rewrite introduced:
+    # drop a comma left dangling right after a colon (":<ul>" -> ": ,"), collapse
+    # repeated commas, strip trailing comma/space, and de-pad "( X )" parentheses.
     text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r':\s*,', ':', text)
+    text = re.sub(r'(?:\s*,){2,}', ',', text)
+    text = re.sub(r'\s*,\s*', ', ', text)
+    text = re.sub(r'[\s,]+$', '', text)
+    text = re.sub(r'\(\s+', '(', text)
+    text = re.sub(r'\s+\)', ')', text)
     return text
 
 # ── Lookup helpers ────────────────────────────────────────────────────────────
@@ -213,7 +234,7 @@ def build_unit_block(ds_row, dfs):
     if not unit_comp.empty:
         lines.append("## Unit Composition")
         for _, c in unit_comp.iterrows():
-            lines.append(f"- {safe(c['description'])}")
+            lines.append(f"- {strip_html(safe(c['description']))}")
         lines.append("")
 
     # ── Points costs ──
@@ -225,7 +246,7 @@ def build_unit_block(ds_row, dfs):
     if not unit_costs.empty:
         lines.append("## Points Costs")
         for _, c in unit_costs.iterrows():
-            desc = safe(c["description"], "")
+            desc = strip_html(safe(c["description"], ""))
             cost = safe(c["cost"], "")
             if desc and cost:
                 lines.append(f"- {desc}: **{cost} pts**")
@@ -245,7 +266,7 @@ def build_unit_block(ds_row, dfs):
         lines.append("|---|---|---|---|---|---|---|---|")
         for _, w in unit_wg.iterrows():
             wname = safe(w["name"])
-            desc  = safe(w.get("description", ""), "")
+            desc  = strip_html(safe(w.get("description", ""), ""))
             dice  = safe(w.get("dice", ""), "")
             label = f"{dice}× {wname}" if dice and dice != "—" else wname
             lines.append(
@@ -266,7 +287,7 @@ def build_unit_block(ds_row, dfs):
     if not unit_opts.empty:
         lines.append("## Wargear Options")
         for _, o in unit_opts.iterrows():
-            lines.append(f"- {safe(o['description'])}")
+            lines.append(f"- {strip_html(safe(o['description']))}")
         lines.append("")
 
     # ── Abilities ──
@@ -288,11 +309,18 @@ def build_unit_block(ds_row, dfs):
             for _, ab in typed.iterrows():
                 ab_name = safe(ab["name"], "")
                 ab_desc = safe(ab.get("description", ""), "")
+                ab_id   = safe(ab.get("ability_id", ""), "")
 
-                # Resolve empty descriptions via Abilities.csv lookup
-                if (not ab_desc or ab_desc == "—") and not ab_lookup.empty:
-                    ab_id = safe(ab.get("ability_id", ""), "")
-                    if ab_id and ab_id != "—" and ab_id in ab_lookup.index:
+                # Resolve empty name/description via Abilities.csv lookup. The
+                # Datasheets_abilities Faction rows leave both blank, carrying
+                # only ability_id — without this the army rule (e.g. Oath of
+                # Moment) renders as "(Unnamed)" and is dropped by ingest.
+                if (not ab_lookup.empty and ab_id and ab_id != "—"
+                        and ab_id in ab_lookup.index):
+                    if not ab_name or ab_name == "—":
+                        val = ab_lookup.loc[ab_id, "name"]
+                        ab_name = safe(val.iloc[0] if hasattr(val, "iloc") else val, "")
+                    if not ab_desc or ab_desc == "—":
                         val = ab_lookup.loc[ab_id, "description"]
                         ab_desc = safe(val.iloc[0] if hasattr(val, "iloc") else val, "")
 
@@ -416,6 +444,55 @@ def build_enhancement_block(row, factions_df):
     lines.append("")
     return "\n".join(lines)
 
+# ── Army-rule block builder ───────────────────────────────────────────────────
+
+def build_army_rule_block(name, legend, description, faction_names):
+    """One faction army rule (e.g. Oath of Moment) from Abilities.csv.
+
+    `faction_names` is the list of factions sharing this ability id (the same
+    rule id recurs verbatim across allied factions in Abilities.csv).
+    """
+    name        = safe(name)
+    legend      = safe(legend, "")
+    description = strip_html(safe(description, ""))
+    fac         = ", ".join(faction_names) if faction_names else "—"
+
+    lines = []
+    lines.append(f"# Army Rule: {name}")
+    lines.append(f"**Faction:** {fac}  |  **Type:** Army Rule")
+    if legend and legend != "—":
+        lines.append(f"*{legend}*")
+    lines.append("")
+    if description and description != "—":
+        lines.append(description)
+    lines.append("")
+    return "\n".join(lines)
+
+# ── Detachment-rule block builder ─────────────────────────────────────────────
+
+def build_detachment_rule_block(row, factions_df):
+    """One detachment rule (e.g. Armoured Wrath) from Detachment_abilities.csv."""
+    faction_id  = safe(row.get("faction_id", ""), "")
+    fname       = faction_name(faction_id, factions_df)
+    name        = safe(row["name"])
+    detachment  = safe(row.get("detachment", ""), "")
+    description = strip_html(safe(row.get("description", ""), ""))
+    legend      = safe(row.get("legend", ""), "")
+
+    lines = []
+    lines.append(f"# Detachment Rule: {name}")
+    header = f"**Faction:** {fname}  |  **Type:** Detachment Rule"
+    if detachment and detachment != "—":
+        header += f"  |  **Detachment:** {detachment}"
+    lines.append(header)
+    if legend and legend != "—":
+        lines.append(f"*{legend}*")
+    lines.append("")
+    if description and description != "—":
+        lines.append(description)
+    lines.append("")
+    return "\n".join(lines)
+
 # ── Schema validation ─────────────────────────────────────────────────────────
 
 EXPECTED_COLUMNS = {
@@ -426,6 +503,7 @@ EXPECTED_COLUMNS = {
     "keywords":     {"datasheet_id", "keyword", "is_faction_keyword"},
     "stratagems":   {"faction_id", "name", "id", "cp_cost", "turn", "phase", "description"},
     "enhancements": {"faction_id", "id", "name", "description"},
+    "detachment_abilities": {"id", "faction_id", "name", "description", "detachment"},
     "factions":     {"id", "name"},
     "source":       {"id", "name", "errata_date"},
 }
@@ -467,6 +545,7 @@ def run(force=False, edition="10e"):
     # 4. Generate blocks
     written = 0
     skipped = 0
+    emitted = set()   # every block filename this run produced (written OR unchanged)
 
     # ── Unit blocks ──
     for _, row in dfs["datasheets"].iterrows():
@@ -477,6 +556,7 @@ def run(force=False, edition="10e"):
         ds_id   = safe(row["id"])
         content = build_unit_block(row, dfs)
         path    = blocks_dir / f"unit_{ds_id}.md"
+        emitted.add(path.name)
         if write_if_changed(path, content, manifest, force):
             written += 1
         else:
@@ -487,6 +567,7 @@ def run(force=False, edition="10e"):
         strat_id = safe(row["id"])
         content  = build_stratagem_block(row, dfs["factions"])
         path     = blocks_dir / f"stratagem_{strat_id}.md"
+        emitted.add(path.name)
         if write_if_changed(path, content, manifest, force):
             written += 1
         else:
@@ -497,15 +578,68 @@ def run(force=False, edition="10e"):
         enh_id  = safe(row["id"])
         content = build_enhancement_block(row, dfs["factions"])
         path    = blocks_dir / f"enhancement_{enh_id}.md"
+        emitted.add(path.name)
         if write_if_changed(path, content, manifest, force):
             written += 1
         else:
             skipped += 1
 
-    # 5. Save manifest
+    # ── Army-rule blocks (faction-scoped Abilities.csv rows only) ──
+    # Core USRs (Deep Strike, Leader, …) carry a blank faction_id and are
+    # already covered by the scraped Core Rules corpus — exclude them by
+    # keeping only rows whose faction_id is a real faction. The same rule id
+    # recurs verbatim across allied factions, so emit one block per id.
+    ab_df = dfs["abilities"]
+    if not ab_df.empty:
+        fac_ids   = set(dfs["factions"]["id"]) if not dfs["factions"].empty else set()
+        army_rows = ab_df[ab_df["faction_id"].isin(fac_ids)]
+        for ab_id, grp in army_rows.groupby("id", sort=False):
+            first      = grp.iloc[0]
+            fac_names  = []
+            for fid in grp["faction_id"]:
+                fn = faction_name(safe(fid, ""), dfs["factions"])
+                if fn not in fac_names:
+                    fac_names.append(fn)
+            content = build_army_rule_block(
+                first["name"], first.get("legend", ""),
+                first.get("description", ""), fac_names,
+            )
+            path = blocks_dir / f"army_rule_{safe(ab_id)}.md"
+            emitted.add(path.name)
+            if write_if_changed(path, content, manifest, force):
+                written += 1
+            else:
+                skipped += 1
+
+    # ── Detachment-rule blocks ──
+    for _, row in dfs["detachment_abilities"].iterrows():
+        det_id  = safe(row["id"])
+        content = build_detachment_rule_block(row, dfs["factions"])
+        path    = blocks_dir / f"detachment_rule_{det_id}.md"
+        emitted.add(path.name)
+        if write_if_changed(path, content, manifest, force):
+            written += 1
+        else:
+            skipped += 1
+
+    # 5. Sweep orphaned ETL blocks — IDs that are no longer in the current CSVs
+    # (datasheets/stratagems/etc. that Wahapedia removed or renumbered). ETL owns
+    # these prefixes; the scraper owns core_rules_/<mission_pack>_, so we only ever
+    # delete our own. Nothing else prunes, so without this sweep a removed unit's
+    # .md — and, once ingested, its embedding — would persist in the corpus forever.
+    ETL_PREFIXES = ("unit_", "stratagem_", "enhancement_", "army_rule_", "detachment_rule_")
+    removed = 0
+    for f in blocks_dir.glob("*.md"):
+        if f.name.startswith(ETL_PREFIXES) and f.name not in emitted:
+            f.unlink()
+            manifest.pop(f.name, None)
+            removed += 1
+
+    # 6. Save manifest
     save_manifest(manifest_path, manifest)
 
-    print(f"ETL complete: {written} written, {skipped} skipped (unchanged or virtual)")
+    print(f"ETL complete: {written} written, {skipped} skipped (unchanged or virtual), "
+          f"{removed} orphan blocks swept")
     return written, skipped
 
 # ── Entry point ───────────────────────────────────────────────────────────────

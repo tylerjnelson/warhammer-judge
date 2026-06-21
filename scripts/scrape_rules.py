@@ -291,17 +291,35 @@ def extract_columns2_block(col2, page_config, seed_heading):
     current_heading = seed_heading
     current_lines   = []
 
+    # Wahapedia lays a rule body out as a flat run of loose #text nodes interleaved
+    # with inline keyword/term elements (<span class="kwb">AIRCRAFT</span>, <a>term
+    # links</a>, emphasis). These are all one paragraph, so we accumulate the run in
+    # prose_buf and emit it as a SINGLE line; appending each fragment straight to
+    # current_lines (then "\n".join in flush) shattered the paragraph one keyword
+    # per line. prose_buf is flushed at every real block boundary (heading, list,
+    # table, card, self-titled box) so structure is preserved.
+    prose_buf = []
+    INLINE    = {"a", "span", "i", "b", "em", "strong", "sup", "sub"}
+
+    def flush_prose():
+        if prose_buf:
+            joined = clean_text(" ".join(prose_buf))
+            if joined:
+                current_lines.append(joined)
+            prose_buf.clear()
+
     for node in col2.children:
         if isinstance(node, NavigableString):
             text = clean_text(str(node))
             if text:
-                current_lines.append(text)
+                prose_buf.append(text)
             continue
         name = node.name
         if not name:
             continue
 
         if name in ("h2", "h3"):
+            flush_prose()
             flush(current_heading, current_lines)
             current_heading = clean_text(node.get_text(separator=" "))
             current_lines   = []
@@ -313,11 +331,20 @@ def extract_columns2_block(col2, page_config, seed_heading):
         if "redDiamond3" in classes:            # decorative step-number diamond
             continue
 
+        # Inline keyword/term elements are part of the surrounding sentence —
+        # coalesce them into the running paragraph rather than breaking the line.
+        if name in INLINE:
+            text = clean_text(node.get_text(separator=" "))
+            if text:
+                prose_buf.append(text)
+            continue
+
         # Stat tables (Wound/Hit roll, Pivot value, D3) — row-format, don't flatten.
         # A wrapper div often holds BOTH prose and a table (the Dice intro + D3
         # table, the Pivots prose + pivot-value table); capture the non-table
         # prose first so it isn't dropped, then the table rows.
         if name == "table" or node.find("table"):
+            flush_prose()
             if name != "table":
                 prose = clean_text(" ".join(
                     str(s) for s in node.find_all(string=True)
@@ -327,6 +354,7 @@ def extract_columns2_block(col2, page_config, seed_heading):
             current_lines.extend(table_to_lines(node))
             continue
         if name in ("ul", "ol"):
+            flush_prose()
             for li in node.find_all("li", recursive=False):
                 text = clean_text(li.get_text(separator=" "))
                 if text:
@@ -334,6 +362,7 @@ def extract_columns2_block(col2, page_config, seed_heading):
             continue
         # Leviathan mission cards that sit inside a Columns2 (cgCard*)
         if any(str(c).startswith("cgCard") for c in classes):
+            flush_prose()
             text = extract_card_text(node)
             if text:
                 current_lines.append(text)
@@ -358,19 +387,23 @@ def extract_columns2_block(col2, page_config, seed_heading):
             lead       = re.match(r"^\d+\s+", box_text)
             body_start = box_text[lead.end():] if lead else box_text
             if title and body_start.startswith(title) and len(body_start) - len(title) > 40:
+                flush_prose()
                 flush(current_heading, current_lines)
                 body            = body_start[len(title):].strip()
                 current_heading = title
                 current_lines   = [body] if body else []
                 continue
 
-        # Default: inline (a/span), prose (p/div), and frame/BreakInsideAvoid
-        # summary boxes → flattened text. Joined per-section, so the per-fragment
-        # length floor the old code applied (which dropped loose prose) is gone.
+        # Default: block prose (p/div) and frame/BreakInsideAvoid summary boxes →
+        # flattened text, each its own line. Flush the running inline paragraph
+        # first so it isn't glued onto this block. An empty layout <div> carries no
+        # text, so it must NOT flush — otherwise it would split a paragraph in two.
         text = clean_text(node.get_text(separator=" "))
         if text:
+            flush_prose()
             current_lines.append(text)
 
+    flush_prose()
     flush(current_heading, current_lines)
     return sections
 
@@ -760,7 +793,7 @@ def scrape_page(key, page_config, manifest, blocks_dir, force=False):
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"[ERROR] Failed to fetch {url}: {e}", file=sys.stderr)
-        return 0, 0
+        return 0, 0, None
 
     soup = BeautifulSoup(resp.content, "html.parser")
 
@@ -773,16 +806,18 @@ def scrape_page(key, page_config, manifest, blocks_dir, force=False):
 
     sections = split_into_sections(soup, page_config)
 
-    written = 0
-    skipped = 0
+    written  = 0
+    skipped  = 0
+    emitted  = set()   # filenames this page produced — drives the orphan sweep
     for filename, content in sections:
+        emitted.add(filename)
         path = blocks_dir / filename
         if write_if_changed(path, content, manifest, force):
             written += 1
         else:
             skipped += 1
 
-    return written, skipped
+    return written, skipped, emitted
 
 def run(pages=("core_rules", "mission_pack"), force=False, edition="10e"):
     ed            = config.get_edition(edition)
@@ -795,16 +830,31 @@ def run(pages=("core_rules", "mission_pack"), force=False, edition="10e"):
     total_written  = 0
     total_skipped  = 0
 
+    total_removed  = 0
+
     for key in pages:
         page_config = all_pages[key]
         print(f"Scraping {key} from {page_config['url']}...")
-        written, skipped = scrape_page(key, page_config, manifest, blocks_dir, force)
-        print(f"  {key}: {written} written, {skipped} skipped")
+        written, skipped, emitted = scrape_page(key, page_config, manifest, blocks_dir, force)
+        # Sweep orphaned sections for THIS page only — a heading the page no longer
+        # carries leaves a stale {prefix}_{slug}.md behind. Skip the sweep when the
+        # fetch failed (emitted is None) so a network blip can't wipe the corpus.
+        removed = 0
+        if emitted is not None:
+            prefix = page_config["prefix"]
+            for f in blocks_dir.glob(f"{prefix}_*.md"):
+                if f.name not in emitted:
+                    f.unlink()
+                    manifest.pop(f.name, None)
+                    removed += 1
+        print(f"  {key}: {written} written, {skipped} skipped, {removed} swept")
         total_written += written
         total_skipped += skipped
+        total_removed  += removed
 
     save_manifest(manifest_path, manifest)
-    print(f"\nScrape complete: {total_written} written, {total_skipped} skipped (unchanged)")
+    print(f"\nScrape complete: {total_written} written, {total_skipped} skipped (unchanged), "
+          f"{total_removed} orphan blocks swept")
     return total_written, total_skipped
 
 # ── Entry point ───────────────────────────────────────────────────────────────

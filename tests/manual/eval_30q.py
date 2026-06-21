@@ -191,8 +191,34 @@ ILLEGAL = [
      {}),
 ]
 
+# ARMY / DETACHMENT rules: the top-level faction rules (Abilities.csv army rules +
+# Detachment_abilities.csv detachment rules) that ride the always-available rules
+# slice (app.rules_where now allows Army_Rule / Detachment_Rule). Each names the rule
+# so it cosine-lands in the rules-slice pool, then the reranker reserves it; the
+# distinctive rule-name group proves the right chunk reached context, not a near-miss.
+# (mission_pack OFF — faction rules are not mission-pack-gated.) See
+# spec/army-detachment-rules.md.
+ARMY_DETACHMENT = [
+    ("What does the Space Marines army rule Oath of Moment do, and when do I pick "
+     "the target?",
+     [["oath of moment"], ["re-roll"], ["command phase"]]),
+    ("What is the Ironstorm Spearhead detachment rule Armoured Wrath, and what can "
+     "each Adeptus Astartes unit re-roll?",
+     [["armoured wrath"], ["ironstorm spearhead"], ["re-roll one hit roll", "re-roll"]]),
+    ("How does the Heretic Astartes army rule Dark Pacts work, and what test must the "
+     "unit take?",
+     [["dark pacts"], ["leadership test"], ["lethal hits", "sustained hits"]]),
+    ("What does the T’au Empire army rule For the Greater Good do with Observer and "
+     "Spotted units?",
+     [["for the greater good"], ["observer"], ["spotted"]]),
+    ("What does the Necrons Awakened Dynasty detachment rule Command Protocols do "
+     "while a Character is leading the unit?",
+     [["command protocols"], ["awakened dynasty"], ["hit roll"]]),
+]
+
 SUITES = [("CORE", CORE, False), ("LEVIATHAN", LEVIATHAN, True),
-          ("UNITS", UNITS, False), ("ILLEGAL", ILLEGAL, False)]
+          ("UNITS", UNITS, False), ("ILLEGAL", ILLEGAL, False),
+          ("ARMY_DETACHMENT", ARMY_DETACHMENT, False)]
 
 
 def run_pipeline(query, mp_mode):
