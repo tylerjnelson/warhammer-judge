@@ -98,6 +98,12 @@ def clean_text(text):
             .replace("\u2014", "--")
             .replace("\u2022", "-"))
     text = re.sub(r"\s+", " ", text).strip()
+    # get_text(separator=" ") inserts a space between every text node, so a link
+    # or keyword span immediately followed by sentence punctuation in a separate
+    # node yields "Fight phase ." / "any enemy units ,". Re-glue the punctuation
+    # to the preceding word. Only closing punctuation, so measurement quotes (12")
+    # and dice ("+1") are untouched.
+    text = re.sub(r'\s+([.,;:!?)])', r"\1", text)
     # Dice notation: after substitute_dice_images() turns <img d4.png> into "4",
     # the digit and its trailing "+" are separate nodes, so get_text(" ") yields
     # "4 +". Re-glue to "4+" (a digit followed only by whitespace then "+"). Safe
@@ -204,6 +210,42 @@ def extract_card_text(element):
             lines.append(combined)
 
     return "\n".join(lines)
+
+# ── Numbered-sequence panel ───────────────────────────────────────────────────
+
+# Decorative + structural classes of a Wahapedia step-sequence box. The numbers
+# live in redDiamondText, the step labels in hi_custom_red; everything else is
+# intro/outro prose.
+_SEQ_CLASSES = {"redDiamond", "redDiamond3", "redDiamondText", "redDiamondLine",
+                "redDiamondBottomLine", "hi_custom_red"}
+
+def extract_sequence_box(element):
+    """A numbered-sequence panel (e.g. the Charge/Shooting/Fight phase boxes):
+    intro prose followed by alternating redDiamondText numbers and hi_custom_red
+    step labels. A flat get_text() mashes these into one run
+    ("1 SELECT ELIGIBLE UNIT 2 SELECT TARGETS ..."); rebuild them as one
+    "N. LABEL" per line. Returns the formatted block, or None when the element
+    has no step structure (so the caller falls back to plain get_text)."""
+    labels = element.find_all(class_="hi_custom_red")
+    nums   = [clean_text(n.get_text(" ")) for n in element.find_all(class_="redDiamondText")]
+    if not labels or len(nums) < 2:
+        return None
+    # Intro = box text that lives outside the diamond/label scaffolding.
+    intro = []
+    for s in element.find_all(string=True):
+        if any(_SEQ_CLASSES & set(p.get("class") or []) for p in s.parents):
+            continue
+        t = clean_text(str(s))
+        if t:
+            intro.append(t)
+    lines = []
+    joined_intro = clean_text(" ".join(intro))
+    if joined_intro:
+        lines.append(joined_intro)
+    for i, lab in enumerate(labels):
+        num = nums[i] if i < len(nums) else str(i + 1)
+        lines.append(f"{num}. {clean_text(lab.get_text(' '))}")
+    return "\n".join(l for l in lines if l)
 
 # ── Columns2 block extractor ──────────────────────────────────────────────────
 
@@ -393,6 +435,14 @@ def extract_columns2_block(col2, page_config, seed_heading):
                 current_heading = title
                 current_lines   = [body] if body else []
                 continue
+
+        # Numbered step-sequence panel (Charge/Shooting/Fight phase boxes nested in
+        # this Columns2): keep one "N. STEP" per line instead of the flattened run.
+        seq = extract_sequence_box(node) if hasattr(node, "find_all") else None
+        if seq:
+            flush_prose()
+            current_lines.append(seq)
+            continue
 
         # Default: block prose (p/div) and frame/BreakInsideAvoid summary boxes →
         # flattened text, each its own line. Flush the running inline paragraph
@@ -690,7 +740,10 @@ def split_into_sections(soup, page_config):
                 for child in element.find_all(True):
                     processed_cards.add(id(child))
 
-                box_text = clean_text(element.get_text(separator=" "))
+                # A numbered step-sequence box (Charge/Shooting/Fight phase, mission
+                # sequence) must keep one step per line; flat get_text mashes them.
+                box_text = extract_sequence_box(element) or clean_text(
+                    element.get_text(separator=" "))
                 if not (box_text and len(box_text) > 30):
                     pass
                 else:

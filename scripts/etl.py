@@ -143,6 +143,10 @@ def strip_html(text):
     text = re.sub(r'[\s,]+$', '', text)
     text = re.sub(r'\(\s+', '(', text)
     text = re.sub(r'\s+\)', ')', text)
+    # A stripped inline tag (<a>Charge roll</a> .) leaves a space before the
+    # sentence punctuation that followed it ("Charge roll ."). Re-glue closing
+    # punctuation to the preceding word (commas/parens handled above).
+    text = re.sub(r'\s+([.;:!?])', r'\1', text)
     return text
 
 # ── Lookup helpers ────────────────────────────────────────────────────────────

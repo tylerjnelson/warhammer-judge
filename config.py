@@ -143,6 +143,18 @@ RULES_SEQUENCES = {
 # chunks are never retrieved at all (HARD INVARIANT — where-filter).
 AUTHORITY_TIEBREAK       = 0.001   # mission-pack gets 2×, Core 1× — ties only
 
+# The cross-encoder SATURATES (~1.0) on named-unit chunks and TANKS (~0.0) on
+# general rules text even when it is adjudication-critical (a procedural overview
+# like CHARGE PHASE, or a long passage whose decisive clause is buried — the model
+# doesn't read them as a "direct answer"). When it zeros a batch of rules, ranking
+# by rerank alone discards the bi-encoder's cosine signal, so a genuinely relevant
+# rule (CHARGE PHASE cosine ~0.51) ties with deployment filler (cosine ~0.31) and
+# can be crowded out of the reserved rule slots at random. RERANK_COSINE_FLOOR keeps
+# cosine as a sub-rerank floor: relevance = max(rerank, W·cosine). W is small enough
+# that a blended cosine (≤ W) never leapfrogs a genuinely reranked chunk (rerank
+# 0.7+), it only re-orders the chunks the reranker flattened to ~0. See boosted_score.
+RERANK_COSINE_FLOOR      = 0.4     # W; 0 restores pure-rerank ranking
+
 # ── Dependency seeding params (used by the LIVE seed_definitions/seed_referenced_rules
 #    path via rank_seeded_below_parents + _gate_and_build). The old HYBRID_DEP_BOOST
 #    flag + inject_dependency_boosts() it gated were removed 2026-06-20 (superseded by
@@ -170,6 +182,34 @@ RULES_DEP_GRAPH_PATH    = "data/dep_graph_{edition}.json"
 RERANK_MODEL        = "cross-encoder/ms-marco-TinyBERT-L2-v2"  # ~26 ms/candidate on prod CPU
 RERANK_CANDIDATES   = 48      # first-stage pool the reranker sorts (N=48 ≈ 1.25 s, accepted)
 RERANK_USE_EXPANDED = False   # rerank against the RAW user query, not the synonym-expanded one
+
+# ── Clause-segmented max-pool reranking (experimental) ────────────────────────
+# A compound question ("after i charge … how far can i pile in") is lexically
+# dominated by its framing clause, so the cross-encoder scores every candidate
+# against a charge-blurred query and BURIES the chunk that answers the operative
+# clause (Pile In: rerank 0.001, ranked last). When ON, rerank_pools SEGMENTS the
+# query on subordinator/discourse markers (after/if/when/then/…) + punctuation and
+# scores each candidate against EVERY segment, keeping the MAX — so a chunk is
+# judged on the single clause it best answers, not the averaged blur. The WHOLE
+# query is always one of the segments, so max can only LIFT a chunk above its
+# single-query baseline, never demote it (monotonic-safe; worst case == OFF). Only
+# fires when a marker is found (single-clause queries are untouched, zero added
+# latency). Cost: up to (RERANK_SEGMENT_MAX+1)x cross-encoder passes on compound
+# queries only. See the segment_query / rerank_pools docstrings.
+RERANK_SEGMENT_MAXPOOL = True   # master switch (A/B-verified: target Pile-In 8→1,
+                                # gate 23/23 on+off, 0 ranking regressions)
+RERANK_SEGMENT_MAX     = 2      # max operative (interrogative-headed) clauses kept
+                                # before the whole-query fallback segment is added
+# Max-pool compresses the saturated top cluster (a compound query lifts EVERY
+# clause's best chunk to ~0.99), so the rank-1 slot is then decided by a noisy
+# ~0.01 margin — which can let a chunk that nails a SECONDARY clause out-rank the
+# true subject ("when i pile in … into engagement range" demoted Pile In 1→5).
+# Tiebreak: final score = maxpool + W·(whole-query score). W is small enough that a
+# genuinely separated chunk (Pile In 0.96 vs 0.04) keeps its max-pool win, but large
+# enough that within the 0.99-cluster the HOLISTIC whole-query relevance decides —
+# restoring the real subject to #1. Only applies on the segmented (multi-clause)
+# path; single-clause queries are a pure monotonic rescale (ranking unchanged).
+RERANK_SEGMENT_TIEBREAK = 0.05
 
 # Span-bridge gate for seeded child definitions (spec/reranker.md §8d). A dependency
 # (engagement_range) reads as IRRELEVANT to the query by similarity, so we never
