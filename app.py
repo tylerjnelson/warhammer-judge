@@ -976,14 +976,20 @@ def _reserve_unit_chunks(unit_chunks: list, reserved_keys: set, rank) -> list:
     unless that 2nd is legitimately irrelevant. Per-unit (not global) so one named unit
     can't sweep the slots from another in a multi-unit question.
 
-    SELECTION SIGNAL = rerank + cosine. The cross-encoder SATURATES (~1.0) on every
-    chunk of a named unit when the query names that unit prominently ("can my Venerable
-    Land Raider charge" → Composition, Transport, Assault Ramp ALL ~0.9996), so rerank
-    alone reserves arbitrary stat-block fluff and misses the answer-bearing ability
-    (Assault Ramp, cosine 0.68). Adding the (propagated) cosine breaks that tie. It is a
-    NO-OP when a unit never surfaced semantically (cosine 0 — e.g. Abaddon's datasheet
-    for a "Devastating Wounds" question, where rerank 0.845 already discriminates), so
-    the tuned rerank-only behavior is preserved.
+    SELECTION SIGNAL = rerank (segment-maxpool). The cross-encoder SATURATES (~1.0) on
+    every chunk of a named unit when the query names that unit prominently ("can my
+    Venerable Land Raider charge" → Composition, Transport, Assault Ramp ALL ~0.9996).
+    The OLD fix added the propagated whole-query cosine to break that tie toward the
+    answer-bearing ability. But once RERANK_SEGMENT_MAXPOOL shipped, the reranker scores
+    each chunk against the query's individual CLAUSES and keeps the max, so the operative
+    section is lifted on rerank alone (Assault Ramp, Grot Riggers both verified). The
+    cosine term then became a LIABILITY on compound questions: cosine is a whole-query
+    signal that favors the DOMINANT clause's stat-block sections (which surfaced
+    semantically) over a secondary clause's ability whose chunk never surfaced (cosine 0,
+    e.g. Trukk's "Grot Riggers" behind "transport capacity"), starving the 2nd clause and
+    sweeping both per-unit slots with the dominant topic. Ranking on the segment-aware
+    rerank alone covers BOTH clauses (eval_30q 41/41, eval_retrieval 23/23, Assault Ramp
+    still reserved).
 
     "Legitimately irrelevant 2nd" is judged RELATIVELY (within UNIT_SECOND_RATIO of the
     unit's own best) — BUT only when the best chunk's score is itself meaningful
@@ -992,8 +998,8 @@ def _reserve_unit_chunks(unit_chunks: list, reserved_keys: set, rank) -> list:
     them, so the ratio would amplify pure noise into a spurious "6× worse" drop and lose
     a genuinely useful chunk (Snikrot's datasheet, which proves he HAS Infiltrators).
     Below the floor we keep both — same reasoning that sets the absolute gate to 0."""
-    def sel(c):                                               # rerank + cosine
-        return rank(c) + (c.get("similarity") or 0.0)
+    def sel(c):                                               # segment-aware rerank
+        return rank(c)
     by_unit = defaultdict(list)
     for c in deduplicate_chunks(unit_chunks or []):
         if content_key(c) not in reserved_keys:
@@ -1048,10 +1054,11 @@ def assemble_context(main_chunks: list, rules_chunks: list, edition: str,
     reserved_keys   = {content_key(c) for c in guaranteed}
 
     # Propagate the semantic COSINE of any unit-slice chunk that ALSO surfaced in the
-    # main pool onto its slice copy (the metadata fetch leaves slice chunks at 0.0), so
-    # _reserve_unit_chunks can tell a unit's answer-bearing section from its stat-block
-    # fluff even when the cross-encoder saturates on the named unit. No-op for sections
-    # that never surfaced semantically (they stay 0.0).
+    # main pool onto its slice copy (the metadata fetch leaves slice chunks at 0.0), so a
+    # unit chunk that the cross-encoder rates near-zero can still clear boosted_score via
+    # its RERANK_COSINE_FLOOR floor. (This used to also break _reserve_unit_chunks' slot
+    # ties, but that now ranks on the segment-aware rerank alone — see its docstring — so
+    # this only feeds the cosine floor.) No-op for sections that never surfaced (stay 0.0).
     cos_by_key: dict = {}
     for c in main_chunks:
         s = c.get("similarity")
