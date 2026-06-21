@@ -49,12 +49,24 @@ def build_faction_keyword_map(edition: str):
             factions[name.lower()] = name
     return kw_map, factions
 
-def detect_faction(query: str, factions: dict) -> str | None:
+def detect_factions(query: str, factions: dict) -> list[str]:
+    """EVERY faction whose full name appears in the query, longest-name-first and
+    de-duplicated. A query can legitimately name more than one ('my Orks embarked in a
+    Space Marines Land Raider'), so faction detection is multi-valued: unit
+    clarification resolves each named unit against its OWN faction instead of force-
+    pinning the whole query to the first match (which silently dropped the other unit)."""
     q = query.lower()
+    out: list[str] = []
     for fname_lower, fname in sorted(factions.items(), key=lambda x: -len(x[0])):
-        if fname_lower in q:
-            return fname
-    return None
+        if fname_lower in q and fname not in out:
+            out.append(fname)
+    return out
+
+def detect_faction(query: str, factions: dict) -> str | None:
+    """The single most-specific faction named (longest name first), or None. Thin
+    back-compat wrapper over detect_factions for the single-pin retrieval where-builder."""
+    found = detect_factions(query, factions)
+    return found[0] if found else None
 
 # Generic role / wargear words that appear *inside* datasheet names but are also
 # everyday rules vocabulary ("when a Captain leads a squad", "models in the unit").
@@ -302,25 +314,42 @@ def chassis_family(ref: str, edition: str) -> dict:
         out[army] = deduped
     return out
 
-def _new_unit_state(ref: str, family: dict, pinned: str | None):
+def _resolve_in_faction(ref: str, family: dict, faction: str):
+    """Finalize (single variant) or prompt for the variant within ONE known faction."""
+    variants = family[faction]
+    if len(variants) <= 1:
+        return "auto", {"ref": ref, "unit_name": variants[0], "army": faction}
+    return "ask", {"ref": ref, "family": {faction: variants},
+                   "stage": "variant", "army": faction}
+
+def _new_unit_state(ref: str, family: dict, sidebar_pin: str | None,
+                    detected: set[str]):
     """Per-reference clarification sub-state, or a finalized {ref,unit_name,army}
     resolution when no question is needed. Returns ("ask", unit_dict) |
-    ("auto", resolution_dict) | ("skip", None)."""
-    if pinned:
-        if pinned not in family:
-            return "skip", None          # pinned faction doesn't field this unit
-        variants = family[pinned]
-        if len(variants) <= 1:
-            return "auto", {"ref": ref, "unit_name": variants[0], "army": pinned}
-        return "ask", {"ref": ref, "family": {pinned: variants},
-                       "stage": "variant", "army": pinned}
+    ("auto", resolution_dict) | ("skip", None).
+
+    Faction is resolved PER UNIT, not per query. A detected faction only pins THIS
+    chassis if it actually fields it: 'my Orks in a Land Raider' detects {Orks}, but the
+    Land Raider (Space Marines/Custodes/Chaos) is not an Orks unit, so it is NOT pinned —
+    it still prompts for its own faction. That keeps every ambiguous unit clarifiable in
+    a multi-faction query instead of being silently dropped (the prior single-pin bug)."""
+    # An explicit sidebar faction is the user's authoritative global choice: honour it,
+    # and if it cannot field this unit there is nothing to ask.
+    if sidebar_pin:
+        if sidebar_pin not in family:
+            return "skip", None
+        return _resolve_in_faction(ref, family, sidebar_pin)
+    # Query-detected factions that actually field THIS chassis.
+    applicable = [f for f in family if f in detected]
+    if len(applicable) == 1:
+        return _resolve_in_faction(ref, family, applicable[0])
+    if len(applicable) >= 2:                       # query named >1 of this unit's factions
+        return "ask", {"ref": ref, "family": {f: family[f] for f in applicable},
+                       "stage": "faction", "army": None}
+    # No detected faction fields this unit → resolve across its full family.
     armies = list(family)
     if len(armies) == 1:
-        variants = family[armies[0]]
-        if len(variants) <= 1:
-            return "auto", {"ref": ref, "unit_name": variants[0], "army": armies[0]}
-        return "ask", {"ref": ref, "family": family, "stage": "variant",
-                       "army": armies[0]}
+        return _resolve_in_faction(ref, family, armies[0])
     return "ask", {"ref": ref, "family": family, "stage": "faction", "army": None}
 
 def build_clarification_queue(query: str, edition: str,
@@ -337,11 +366,11 @@ def build_clarification_queue(query: str, edition: str,
     needed no question (a faction that fields exactly one variant auto-resolves).
     """
     _, factions = build_faction_keyword_map(edition)
-    pinned = None
-    if selected_faction and selected_faction != "All Factions":
-        pinned = selected_faction
-    else:
-        pinned = detect_faction(query, factions)
+    sidebar_pin = (selected_faction if selected_faction
+                   and selected_faction != "All Factions" else None)
+    # Multi-valued: a faction signal pins each unit independently (see _new_unit_state),
+    # so a query naming two factions clarifies BOTH units instead of dropping one.
+    detected = set(detect_factions(query, factions))
 
     names, _ = get_unit_name_resolver(edition)
     units, resolved = [], []
@@ -357,7 +386,7 @@ def build_clarification_queue(query: str, edition: str,
         family = chassis_family(ref, edition)
         if not family:
             continue
-        kind, payload = _new_unit_state(ref, family, pinned)
+        kind, payload = _new_unit_state(ref, family, sidebar_pin, detected)
         slot_fields = {"slot_id": slot["id"], "start": slot["start"], "end": slot["end"]}
         if kind == "ask":
             units.append({**payload, **slot_fields})

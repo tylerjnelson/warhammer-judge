@@ -277,7 +277,7 @@ SYNONYMS = {
 # Moved to clarify.py (Phase 5). Re-exported so process_query / retrieve_unit_slice /
 # render_chat / the sidebar keep calling these by their original names.
 from clarify import (                                                  # noqa: E402
-    build_faction_keyword_map, detect_faction, build_unit_index, detect_unit,
+    build_faction_keyword_map, detect_faction, detect_factions, build_unit_index, detect_unit,
     get_unit_name_resolver, resolve_named_units, find_unit_occurrences, unit_armies,
     is_chassis_base, chassis_family, build_clarification_queue, next_clarification,
     apply_clarification, highlight_ref, apply_resolution_to_query,
@@ -570,10 +570,16 @@ def retrieve_unit_slice(query: str, edition: str, mission_pack_mode: bool,
         targets = [(r["unit_name"], r.get("army")) for r in resolution]
     else:
         _, factions = build_faction_keyword_map(edition)
-        q_faction   = detect_faction(query, factions)
+        detected    = set(detect_factions(query, factions))
         for unit in resolve_named_units(query, edition):
-            armies = unit_armies(unit, edition)
-            army   = q_faction or (armies[0] if len(armies) == 1 else None)
+            armies     = unit_armies(unit, edition)
+            # Per-unit: only pin the army a detected faction actually fields. A unit
+            # whose factions are NONE of the detected ones (an Ork query naming a
+            # Space Marines Land Raider) fetches all its variants (army=None) instead
+            # of being pinned to a faction it can't field → empty fetch → dropped.
+            applicable = [a for a in armies if a in detected]
+            army = (applicable[0] if len(applicable) == 1
+                    else armies[0] if len(armies) == 1 else None)
             targets.append((unit, army))
 
     out = []
@@ -976,42 +982,50 @@ def _reserve_unit_chunks(unit_chunks: list, reserved_keys: set, rank) -> list:
     unless that 2nd is legitimately irrelevant. Per-unit (not global) so one named unit
     can't sweep the slots from another in a multi-unit question.
 
-    SELECTION SIGNAL = rerank (segment-maxpool). The cross-encoder SATURATES (~1.0) on
-    every chunk of a named unit when the query names that unit prominently ("can my
-    Venerable Land Raider charge" → Composition, Transport, Assault Ramp ALL ~0.9996).
-    The OLD fix added the propagated whole-query cosine to break that tie toward the
-    answer-bearing ability. But once RERANK_SEGMENT_MAXPOOL shipped, the reranker scores
-    each chunk against the query's individual CLAUSES and keeps the max, so the operative
-    section is lifted on rerank alone (Assault Ramp, Grot Riggers both verified). The
-    cosine term then became a LIABILITY on compound questions: cosine is a whole-query
-    signal that favors the DOMINANT clause's stat-block sections (which surfaced
-    semantically) over a secondary clause's ability whose chunk never surfaced (cosine 0,
-    e.g. Trukk's "Grot Riggers" behind "transport capacity"), starving the 2nd clause and
-    sweeping both per-unit slots with the dominant topic. Ranking on the segment-aware
-    rerank alone covers BOTH clauses (eval_30q 41/41, eval_retrieval 23/23, Assault Ramp
-    still reserved).
+    ORDERING SIGNAL = rerank at coarse resolution, cosine to break saturated ties.
+    The cross-encoder SATURATES (~1.0, near-tied) on every chunk of a named unit when
+    the query names that unit prominently ("can my Venerable Land Raider charge" →
+    Composition, Transport, Assault Ramp ALL ~1.049, a 0.0007 noise spread), so rerank
+    alone reserves arbitrary stat-block fluff and misses the answer-bearing ability
+    (Assault Ramp, cosine 0.69). Two regimes, one rule:
+      • SATURATED (Land Raider) — rerank carries no signal, so cosine (semantic match to
+        THIS query) is the only thing that finds Assault Ramp.
+      • DISCRIMINATING (Trukk) — RERANK_SEGMENT_MAXPOOL scores each chunk against the
+        query's individual CLAUSES and keeps the max, lifting a NAMED ability ("Grot
+        Riggers") ~0.13 clear of the fluff. There the whole-query cosine is a LIABILITY:
+        it favors the dominant clause's stat-block sections (which surfaced semantically)
+        over the secondary clause's ability (cosine 0), starving the 2nd slot.
+    So sort by (bucketed-rerank, cosine): collapse every chunk within
+    UNIT_RERANK_SATURATION of the unit's top rerank into one tied bucket ordered by
+    cosine, while a chunk that is a genuine rerank-gap below keeps its rerank and sorts
+    under that bucket regardless of cosine. Saturated → cosine decides (Assault Ramp #1);
+    discriminating → the rerank gap decides, cosine only orders within the top cluster
+    (Trukk: Transport + Grot Riggers, the fluff section stays a bucket below).
 
-    "Legitimately irrelevant 2nd" is judged RELATIVELY (within UNIT_SECOND_RATIO of the
-    unit's own best) — BUT only when the best chunk's score is itself meaningful
-    (≥ UNIT_SECOND_FLOOR). When the signal rates a unit's whole chunk set near-zero
-    (a generic ability question — Snikrot's chunks 0.027/0.004), it cannot distinguish
-    them, so the ratio would amplify pure noise into a spurious "6× worse" drop and lose
-    a genuinely useful chunk (Snikrot's datasheet, which proves he HAS Infiltrators).
-    Below the floor we keep both — same reasoning that sets the absolute gate to 0."""
-    def sel(c):                                               # segment-aware rerank
-        return rank(c)
+    "Legitimately irrelevant 2nd" is judged RELATIVELY on the scalar rerank (within
+    UNIT_SECOND_RATIO of the unit's own best) — BUT only when the best chunk's rerank is
+    itself meaningful (≥ UNIT_SECOND_FLOOR). When the reranker rates a unit's whole chunk
+    set near-zero (a generic ability question — Snikrot's chunks 0.027/0.004), it cannot
+    distinguish them, so the ratio would amplify pure noise into a spurious "6× worse"
+    drop and lose a genuinely useful chunk (Snikrot's datasheet, which proves he HAS
+    Infiltrators). Below the floor we keep both — same reasoning that sets the gate to 0."""
     by_unit = defaultdict(list)
     for c in deduplicate_chunks(unit_chunks or []):
         if content_key(c) not in reserved_keys:
             by_unit[c["metadata"].get("unit_name", "")].append(c)
     keep = []
     for chunks in by_unit.values():
-        chunks.sort(key=sel, reverse=True)
+        top_r = max(rank(c) for c in chunks)                  # the saturated cluster's top
+        def order(c):
+            r = rank(c)                                       # rerank within the band → tie
+            bucket = top_r if r >= top_r - config.UNIT_RERANK_SATURATION else r
+            return (bucket, c.get("similarity") or 0.0)       # cosine breaks the tie
+        chunks.sort(key=order, reverse=True)
         chosen = chunks[:1]                                   # best chunk: always
-        top    = sel(chosen[0])
+        top    = rank(chosen[0])                              # scalar rerank for the gate
         for c in chunks[1:config.UNIT_CHUNKS_PER_UNIT]:       # up to the per-unit cap
             indistinct = top < config.UNIT_SECOND_FLOOR       # signal indifferent → keep
-            if indistinct or sel(c) >= config.UNIT_SECOND_RATIO * top:
+            if indistinct or rank(c) >= config.UNIT_SECOND_RATIO * top:
                 chosen.append(c)
         keep.extend(chosen)
     return keep
@@ -1054,11 +1068,11 @@ def assemble_context(main_chunks: list, rules_chunks: list, edition: str,
     reserved_keys   = {content_key(c) for c in guaranteed}
 
     # Propagate the semantic COSINE of any unit-slice chunk that ALSO surfaced in the
-    # main pool onto its slice copy (the metadata fetch leaves slice chunks at 0.0), so a
-    # unit chunk that the cross-encoder rates near-zero can still clear boosted_score via
-    # its RERANK_COSINE_FLOOR floor. (This used to also break _reserve_unit_chunks' slot
-    # ties, but that now ranks on the segment-aware rerank alone — see its docstring — so
-    # this only feeds the cosine floor.) No-op for sections that never surfaced (stay 0.0).
+    # main pool onto its slice copy (the metadata fetch leaves slice chunks at 0.0), so
+    # _reserve_unit_chunks can break the SATURATED rerank tie by cosine and reserve a
+    # unit's answer-bearing section over its stat-block fluff (Assault Ramp, cosine 0.69)
+    # when the cross-encoder saturates on the named unit. No-op for sections that never
+    # surfaced semantically (they stay 0.0).
     cos_by_key: dict = {}
     for c in main_chunks:
         s = c.get("similarity")
