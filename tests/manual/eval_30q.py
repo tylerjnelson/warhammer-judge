@@ -31,7 +31,7 @@ logging.disable(logging.CRITICAL)
 warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
-import app, config
+import app, config, retrieval
 
 EDITION = "10e"
 TOK     = lambda s: len(s) // config.TOKEN_CHAR_RATIO
@@ -228,25 +228,15 @@ def run_pipeline(query, mp_mode):
     unit slice pins each unit's sole army automatically (multi-faction → deduped/capped).
     Returns the context text, latency, seeded-dep names, and the distribution of named-
     unit chunks that actually reached the final context (unit_name → count)."""
-    expanded, where, _ = app.process_query(query, EDITION, mp_mode)
-    raw    = app.retrieve(expanded, where, EDITION, n_results=config.RERANK_CANDIDATES)
-    units  = app.retrieve_unit_slice(query, EDITION, mp_mode, resolution={})
-    rules  = app.retrieve_rules_slice(expanded, EDITION, mp_mode, config.TOP_K_RULES * 2)
-    rq     = expanded if config.RERANK_USE_EXPANDED else query
-    pool   = raw + rules
-    seeded = (app.seed_definitions(rq, pool, EDITION, mp_mode)
-              + app.seed_referenced_rules(rq, pool, EDITION, mp_mode))
-    raw    = raw + seeded
-    t0     = time.time()
-    app.rerank_pools(rq, EDITION, mp_mode, raw, rules, units)
-    app.rank_seeded_below_parents(raw + rules, EDITION, mp_mode)
-    ms     = (time.time() - t0) * 1000
-    chunks = app.assemble_context(raw, rules, EDITION, mp_mode, unit_chunks=units)
-    final  = app.inject_sequence_neighbors(chunks, EDITION)
-    ctx    = app.format_rules_context(final, BUDGET)
+    t0    = time.time()
+    rctx  = retrieval.run(query, edition=EDITION, mission_pack_mode=mp_mode, resolution={})
+    ms    = (time.time() - t0) * 1000
+    final = rctx.result
+    ctx   = app.format_rules_context(final, BUDGET)
+    seeded = [c for c in rctx.main if c.get("dep_seed")]
     seeded_names = [s.get("dep_stem") or s["metadata"].get("breadcrumb", "?") for s in seeded]
     # Named-unit chunks that survived into final context (for structural checks).
-    unit_keys = {app.content_key(c) for c in units}
+    unit_keys = {app.content_key(c) for c in rctx.units}
     unit_dist = Counter(c["metadata"].get("unit_name") for c in final
                         if app.content_key(c) in unit_keys)
     return ctx, ms, seeded_names, unit_dist
