@@ -62,6 +62,15 @@ TOP_K_RULES        = 4       # guaranteed slots reserved for Core_Rules / missio
 # query (Abaddon vs 'Devastating Wounds') still reaches context. PER-UNIT so one named
 # unit can't sweep the slots from another in a 2-unit question.
 UNIT_CHUNKS_PER_UNIT = 2     # cap of reserved chunks per NAMED unit
+UNIT_RERANK_SATURATION = 0.05  # the cross-encoder SATURATES (~1.0, near-tied) on every
+                             # chunk of a prominently-named unit, so its rerank can't pick
+                             # the answer-bearing section from stat-block fluff. Within
+                             # this band of a unit's TOP rerank, treat chunks as tied and
+                             # break by cosine (semantic match to THIS query) instead;
+                             # outside it, trust rerank. Must sit above the saturated noise
+                             # floor (Land Raider spread 0.027 → all tied → cosine finds
+                             # Assault Ramp) and below a genuine rerank gap (Trukk: segment
+                             # rerank lifts "Grot Riggers" 0.13 clear of fluff → rerank wins).
 UNIT_SECOND_RATIO    = 0.3   # keep a unit's 2nd chunk only if its rerank score is within
                              # this ratio of the unit's OWN best chunk. Relative, not
                              # absolute: the cross-encoder rates a unit's stat-block ~0

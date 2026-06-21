@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-eval_30q.py — 30-question retrieval-quality probe for the shipped Layer-3 path
+eval_quality.py — retrieval-quality probe for the shipped Layer-3 path
 (rerank + dependency seeding + ability→rule context seeding; spec/reranker.md).
+(Formerly eval_30q.py — the suite has grown well past 30 questions; the count is
+computed at runtime, so the filename is no longer numbered.)
 
-Three non-trivial question sets, each pulling chunks from MULTIPLE parts of the
+Several non-trivial question sets, each pulling chunks from MULTIPLE parts of the
 rules (so a single keyword-dense chunk can't satisfy them):
 
-  • CORE      (10) — core-rules questions combining several mechanics
-                     (mission-pack toggle OFF).
-  • LEVIATHAN (10) — Leviathan mission-pack questions (toggle ON).
-  • UNITS     (11) — named-unit / model interactions whose abilities reference a
-                     core or mission-pack rule by name (toggle OFF) — these
-                     exercise seed_referenced_rules (ability → rule context).
+  • CORE       — core-rules questions combining several mechanics (toggle OFF).
+  • LEVIATHAN  — Leviathan mission-pack questions (toggle ON).
+  • UNITS      — named-unit / model interactions whose abilities reference a core
+                 or mission-pack rule by name (toggle OFF); also the multi-unit
+                 reservation and multi-faction clarification guards.
+  • ILLEGAL    — setups that violate a rule; the proving rule must reach context.
+  • ARMY_DETACHMENT — top-level faction / detachment rules ride the rules slice.
 
 Grading: each question lists one or more CONCEPT GROUPS. A group is satisfied if
 ANY of its substrings appears (case-insensitive) in the final budgeted context.
@@ -22,7 +25,7 @@ verified to exist in data/rule_blocks/10e before being added here.
 This is a quality REPORT (per-question + per-group accuracy, seeded deps, latency,
 token budget); the hard pass/fail regression gate stays tests/verify/eval_retrieval.py.
 
-Run:  python tests/manual/eval_30q.py
+Run:  python tests/manual/eval_quality.py
 """
 import logging, sys, time, warnings
 from collections import Counter
@@ -129,7 +132,7 @@ UNITS = [
      [["callidus"], ["snikrot"], ["infiltrator"]],
      {"distinct_units": 2}),
 
-    # ── 4 SINGLE-UNIT / TWO-CHUNK: needs BOTH the unit's datasheet AND a separate
+    # ── 5 SINGLE-UNIT / TWO-CHUNK: needs BOTH the unit's datasheet AND a separate
     #    ability/section chunk → ≥2 chunks of that one unit must be reserved. ───────
     ("What melee weapons does Abaddon the Despoiler have on his datasheet, and what "
      "does his Dark Destiny ability do?",
@@ -146,6 +149,27 @@ UNITS = [
     ("What is the Trukk's transport capacity, and what does its Grot Riggers ability do?",
      [["trukk"], ["transport capacity", "transport"], ["grot riggers"]],
      {"chunks_for": {"Trukk": 2}}),
+    # Saturated-rerank guard: the query NAMES no ability, only the disembark-then-charge
+    # scenario, so the cross-encoder ties every Venerable Land Raider chunk near ~1.05
+    # (0.0007 spread) and rerank can't pick the answer. Assault Ramp is found ONLY by the
+    # cosine tie-break inside the saturated cluster (_reserve_unit_chunks,
+    # UNIT_RERANK_SATURATION). Regresses the moment that tie-break is dropped.
+    ("My unit is embarked in a Venerable Land Raider. If the Venerable Land Raider makes "
+     "a Normal move and my unit then disembarks, can it declare a charge this turn?",
+     [["assault ramp"], ["charge"]],
+     {"chunks_for": {"Venerable Land Raider": 2}}),
+
+    # ── 1 MULTI-FACTION: the query names an Ork unit ('boys'/'orks') AND a cross-
+    #    faction chassis ('land raider'). Detecting 'orks' must NOT pin the whole query
+    #    to Orks and drop the Land Raider — every ambiguous unit must still reach
+    #    context. Regression guard: previously the single faction pin force-applied
+    #    'Orks' to the Land Raider (which no Ork army fields), so it was silently
+    #    skipped and vanished from context entirely, hiding the illegal cross-army
+    #    embarkation from the model. (detect_factions + per-unit faction resolution.) ──
+    ("if my boys are embarked in a land raider and the land raider makes a normal move, "
+     "can my orks get out and charge on the same turn?",
+     [["land raider"], ["disembark"], ["charge"]],
+     {}),
 
     # ── 3 SINGLE-UNIT (simple) ───────────────────────────────────────────────────
     ("Chief Librarian Mephiston has Fights First. If he is in combat with an enemy "

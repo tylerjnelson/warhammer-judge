@@ -21,7 +21,7 @@ logging.disable(logging.CRITICAL); warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 import app, config
-from tests.manual.eval_30q import SUITES, BUDGET, TOK
+from tests.manual.eval_quality import SUITES, BUDGET, TOK
 
 EDITION = "10e"
 OUT = Path(__file__).resolve().parent / "llm_35_report.md"

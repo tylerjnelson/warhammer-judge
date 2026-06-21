@@ -2,7 +2,7 @@
 """
 dump_golden.py — behavioral oracle for the retrieval-pipeline refresh.
 ======================================================================
-Drives the REAL shipped pipeline (mirrors render_chat / eval_30q.run_pipeline)
+Drives the REAL shipped pipeline (mirrors render_chat / eval_quality.run_pipeline)
 over the full standing query set and dumps, for every query, the ORDERED final
 context with each chunk's scores (similarity, rerank, rank_score) + provenance
 flags. Output is a deterministic JSON file used as the regression oracle: the
@@ -65,15 +65,15 @@ def collect_queries():
     """Every query in the standing suite, tagged with its toggle state."""
     import importlib
     er = importlib.import_module("tests.verify.eval_retrieval")
-    q30 = importlib.import_module("tests.manual.eval_30q")
+    eq = importlib.import_module("tests.manual.eval_quality")
     out = []  # (suite, query, mp_mode)
     for case in er.CASES:
         for state in ("on", "off"):
             if case.get(state) is not None:
                 out.append((f"eval_retrieval/{case['layer']}", case["query"], state == "on"))
-    for suite_name, cases, mp in q30.SUITES:
+    for suite_name, cases, mp in eq.SUITES:
         for case in cases:
-            out.append((f"eval_30q/{suite_name}", case[0], mp))
+            out.append((f"eval_quality/{suite_name}", case[0], mp))
     return out
 
 
