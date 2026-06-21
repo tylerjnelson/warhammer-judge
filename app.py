@@ -1035,8 +1035,17 @@ def boosted_score(chunk: dict, edition: str, mission_pack_mode: bool) -> float:
     reranked; the bi-encoder cosine otherwise (e.g. a chunk that bypassed the
     reranker). The authority tiebreak stays deterministic — it encodes the
     mission-pack-overrides-core ordering, never delegated to a learned model.
+
+    When the chunk WAS reranked we keep cosine as a sub-rerank FLOOR
+    (max(rerank, W·cosine)): the cross-encoder tanks ~0 on general rules even when
+    essential, and ranking by that alone discards the bi-encoder signal that still
+    distinguishes a relevant rule from filler. W (RERANK_COSINE_FLOOR) is small
+    enough that a blended cosine never leapfrogs a genuinely reranked chunk — it only
+    re-orders the rules the reranker flattened to ~0. See config.RERANK_COSINE_FLOOR.
     """
-    relevance = chunk["rerank"] if "rerank" in chunk else chunk["similarity"]
+    cos = chunk.get("similarity") or 0.0
+    rer = chunk.get("rerank")
+    relevance = max(rer, config.RERANK_COSINE_FLOOR * cos) if rer is not None else cos
     return relevance + authority_boost(chunk["metadata"], edition, mission_pack_mode)
 
 # ── Cross-encoder reranking (Layer 3, ranking half) ───────────────────────────
@@ -1057,9 +1066,47 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
+# Clause boundaries: subordinator/discourse markers + sentence punctuation. A
+# compound rules question hangs its operative clause off one of these ("AFTER i
+# charge … how far can i pile in", "IF the transport moves, can they charge").
+_SEGMENT_SPLIT_RE = re.compile(
+    r"[.;,]|\b(?:after|before|once|when|whenever|while|if|unless|assuming|"
+    r"given that|provided|so that|in order to|then|and then|but)\b", re.I)
+# The operative clause is the one phrased as a question (interrogative/modal head).
+_INTERROG_RE = re.compile(
+    r"^\s*(?:how|what|can|could|does|do|did|is|are|may|would|should|which|"
+    r"when|where|will|whose|who)\b", re.I)
+
+def segment_query(query: str) -> list[str]:
+    """Split a query into clauses on subordinator/discourse markers + punctuation,
+    keeping the interrogative-headed (operative) ones — pure heuristic, NO model.
+
+    Returns [query] unchanged when no marker is found, so single-clause queries are
+    untouched. When it DOES segment, the whole query is always appended as the last
+    segment, so max-pool (rerank_pools) can only LIFT a chunk above its whole-query
+    score, never demote it — the degradation guarantee. Operative clauses are capped
+    at RERANK_SEGMENT_MAX to bound the cross-encoder cost."""
+    q     = query.strip()
+    parts = [p.strip() for p in _SEGMENT_SPLIT_RE.split(q) if p and len(p.strip()) > 3]
+    if len(parts) <= 1:
+        return [q]
+    interrog = [p for p in parts if _INTERROG_RE.search(p)]
+    kept     = (interrog or parts)[:config.RERANK_SEGMENT_MAX]
+    if q not in kept:                       # whole-query fallback ⇒ monotonic-safe
+        kept.append(q)
+    return kept
+
 def rerank_pools(query: str, edition: str, mission_pack_mode: bool, *pools: list) -> None:
     """Stamp chunk['rerank'] = sigmoid(cross-encoder logit) on every UNIQUE chunk
     across the given candidate pools, scoring each once (deduped by content_key).
+
+    With config.RERANK_SEGMENT_MAXPOOL the query is first SEGMENTED into clauses
+    (segment_query) and each candidate is scored against EVERY segment, keeping the
+    MAX — so a chunk that answers only the operative clause of a compound question
+    ("how far can i pile in") is no longer buried by the framing clause it doesn't
+    match. The whole query is always one segment, so the max is ≥ the single-query
+    score for every chunk (never worse than OFF). No-op shape when the query has one
+    clause (no marker) — identical to the legacy single-pass.
 
     No-op when the model fails to load or there are no candidates — callers fall
     back to cosine via boosted_score. Operates only on already-where-filtered
@@ -1076,9 +1123,26 @@ def rerank_pools(query: str, edition: str, mission_pack_mode: bool, *pools: list
             unique.setdefault(content_key(c), c)
     if not unique:
         return
-    items  = list(unique.values())
-    logits = model.predict([(query, c["text"]) for c in items])
-    score_by_key = {k: _sigmoid(float(s)) for k, s in zip(unique.keys(), logits)}
+    items = list(unique.values())
+    keys  = list(unique.keys())
+
+    segments = segment_query(query) if config.RERANK_SEGMENT_MAXPOOL else [query]
+    if len(segments) == 1:
+        logits       = model.predict([(segments[0], c["text"]) for c in items])
+        score_by_key = {k: _sigmoid(float(s)) for k, s in zip(keys, logits)}
+    else:
+        # MxS pairs, one predict call (the model batches); max-pool the S segment
+        # scores per candidate so it is judged on the clause it best answers, then
+        # add W·(whole-query score) as a tiebreak so the saturated top cluster is
+        # ordered by holistic relevance, not a noisy ~0.01 clause margin. The whole
+        # query is always the LAST segment (segment_query guarantee).
+        flat = model.predict([(seg, c["text"]) for c in items for seg in segments])
+        S    = len(segments)
+        W    = config.RERANK_SEGMENT_TIEBREAK
+        score_by_key = {}
+        for i, k in enumerate(keys):
+            win = [_sigmoid(float(x)) for x in flat[i*S:(i+1)*S]]
+            score_by_key[k] = max(win) + W * win[-1]      # maxpool + tiebreak(whole)
     for pool in pools:
         for c in pool:
             c["rerank"] = score_by_key[content_key(c)]
@@ -1442,7 +1506,13 @@ def assemble_context(main_chunks: list, rules_chunks: list, edition: str,
 
     # Reserved-first so the 2800-token budget (format_rules_context) truncates the
     # discretionary fill before any guaranteed rule/unit chunk.
-    return reserved + rest
+    result = reserved + rest
+    # Stamp the EFFECTIVE ordering score (cosine-floored rerank + authority tiebreak)
+    # so the source expander can surface the number that actually drove the order —
+    # within-tier this is the sort key; across tiers the layout is reserved-first.
+    for c in result:
+        c["rank_score"] = round(rank(c), 4)
+    return result
 
 
 # ── Sequence neighbour injection (Layer 2 Track C) ────────────────────────────
@@ -1492,6 +1562,11 @@ def inject_sequence_neighbors(chunks: list, edition: str) -> list:
                 existing.add(key)
                 # Sort/rank just below the sibling that pulled it in.
                 nb["similarity"] = chunk["similarity"]
+                # Mark provenance so the source expander can list this neighbor
+                # directly after the parent that pulled it in (and label it).
+                nb["seq_neighbor"] = True
+                nb["dep_parent_keys"] = [content_key(chunk)]
+                nb["rank_score"] = chunk.get("rank_score")   # rides with its parent
                 result.append(nb)
     return result
 
@@ -1711,6 +1786,14 @@ def apply_edition_theme(edition: str):
           [data-testid="stSidebar"] {{ border-right: 4px solid {color}; }}
           h1, .stCaption {{ color: {color}; }}
           .stButton button[kind="primary"] {{ background: {color}; }}
+          /* st.code blocks force a horizontal scrollbar by default; wrap them so the
+             source chunks read top-to-bottom while KEEPING the markdown syntax
+             highlighting (the ** / # markers stay styled). */
+          [data-testid="stCode"] pre, [data-testid="stCode"] code {{
+            white-space: pre-wrap !important;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+          }}
         </style>
     """, unsafe_allow_html=True)
 
@@ -2014,25 +2097,59 @@ def render_chat():
 
 # ── Source expander ───────────────────────────────────────────────────────────
 
+def _is_child(c: dict) -> bool:
+    """A chunk pulled in BY a parent (so it should display right after it): a seeded
+    definition/referenced rule (dep_seed) or an injected sequence neighbor."""
+    return bool(c.get("dep_seed") or c.get("seq_neighbor")) and not c.get("unit_seed")
+
+
+def _source_label(c: dict) -> str:
+    """How this chunk entered the candidate pool: the cosine when it was a semantic
+    hit, otherwise the subsystem that pulled it in."""
+    sim = c.get("similarity")
+    if c.get("unit_seed"):   return "unit slice (named unit)"
+    if c.get("dep_seed"):    return "dependency seed (child)"
+    if c.get("seq_neighbor"): return "sequence neighbor (child)"
+    if c.get("lexical"):     return f"lexical `{sim}`"
+    if sim is None:          return "metadata fetch"
+    if sim == 0.0:           return "metadata fetch (cosine `0.0`)"
+    return f"cosine `{sim}`"
+
+
+def _rerank_label(c: dict) -> str:
+    """The EFFECTIVE ranking score that ordered this chunk — boosted_score, i.e.
+    max(cross-encoder rerank, W·cosine) + authority tiebreak (config.RERANK_COSINE_FLOOR).
+    This is the number the chunk was actually sorted by. When it diverges from the raw
+    cross-encoder value (the reranker tanked a rule to ~0 and cosine set the floor) the
+    raw value is shown in parens so the divergence stays visible."""
+    rs  = c.get("rank_score")
+    rer = c.get("rerank")
+    if rs is None:                                          # defensive: never assembled
+        if rer is None:
+            return "not reranked" + (" (sequence neighbor)" if c.get("seq_neighbor") else "")
+        return f"`{round(rer, 3)}`"
+    if rer is not None and abs(rer - rs) > 0.01:           # cosine floor lifted it
+        return f"`{rs}`  (cross-encoder `{round(rer, 3)}`)"
+    return f"`{rs}`"
+
+
 def render_source_expander(chunks: list):
+    # Listed in the SAME order the chunks are sent to the LLM (assemble_context →
+    # inject_sequence_neighbors), so the [i] indices here match the [i] labels in the
+    # rules context the model receives. Children (dep_seed / sequence neighbors) are
+    # marked ↳ but kept in their context position, not regrouped under their parent.
     with st.expander("📖 View Source Chunks", expanded=False):
         for i, chunk in enumerate(chunks, 1):
-            meta = chunk["metadata"]
-            # Show BOTH signals: cosine (semantic) AND the cross-encoder rerank. They
-            # diverge in ways that explain the order — the reranker SATURATES (~1.0) on
-            # any chunk of a named unit, so cosine is the real discriminator among a
-            # unit's sections (Assault Ramp 0.68 vs stat-block fluff 0.0), while it
-            # tanks (~0.0) on rules the cosine rates ~0.5. A seeded unit-slice chunk
-            # carries cosine 0.0 (metadata fetch, never semantically scored).
-            cos  = chunk.get("similarity")
-            rer  = chunk.get("rerank")
-            rer_s = f" · rerank `{round(rer, 3)}`" if rer is not None else ""
-            tag   = " · _unit slice_" if chunk.get("unit_seed") else ""
-            st.markdown(
-                f"**[{i}]** {meta.get('unit_name') or meta.get('category', 'Rule')} "
-                f"· {meta.get('army', '')} · {meta.get('category', '')} "
-                f"· cosine `{cos}`{rer_s}{tag}"
-            )
+            meta   = chunk["metadata"]
+            indent = "↳ " if _is_child(chunk) else ""       # mark children as nested
+            # Join only the populated fields with " · " — core-rule chunks carry no
+            # army (so a fixed 3-slot template printed "Name · · Core_Rules"), and
+            # name falls back to category, so dedup drops the repeated category.
+            name   = meta.get("unit_name") or meta.get("category") or "Rule"
+            header = " · ".join(dict.fromkeys(
+                f for f in (name, meta.get("army"), meta.get("category")) if f))
+            st.markdown(f"**[{i}]** {indent}{header}")
+            st.markdown(f"Source: {_source_label(chunk)}  ·  Rerank: {_rerank_label(chunk)}")
             st.code(chunk["text"][:600] + ("..." if len(chunk["text"]) > 600 else ""),
                     language="markdown")
             if i < len(chunks):
