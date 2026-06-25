@@ -95,10 +95,15 @@ SIMILARITY_THRESHOLD = 0.3   # discard chunks below this cosine similarity (lowe
 # ceiling AND includes the reasoning model's <think> tokens (billed even though we
 # strip them before display). Measured: a complex adjudication completes naturally at
 # ~1.3-1.4K completion tokens; at 1000 it truncated mid-<think> (finish_reason=length),
-# returning a cut-off trace with no ruling. 2048 gives headroom so answers finish
-# (finish_reason=stop). Input (≈2800-tok rules context) still dominates TPM, so this
-# headroom adds little per-call cost. See the rate-limit block above.
-MAX_OUTPUT_TOKENS  = 2048
+# returning a cut-off trace with no ruling. The active model (qwen3-32b) never
+# truncated at 2048, but the eval sweep (2026-06-24) found two reasoning-heavy
+# alternates — qwen3.6-27b and gpt-oss-20b — burning the whole 2048 budget inside
+# <think> and returning EMPTY (finish_reason=length). Raised to 3072 to give those
+# models room to finish so the model comparison isn't confounded by truncation.
+# Per-call TPM stays under the 6K ceiling on a typical ~2800-tok context (≈5.9K);
+# only the rare worst-case context (~3667 tok) gets tight, where call_llm_reduced
+# already retries. Input still dominates TPM, so the +1024 adds little per-call cost.
+MAX_OUTPUT_TOKENS  = 3072
 
 # ── Per-call token budget (Layer 2) ───────────────────────────────────────────
 # The real cap on what reaches the model is a TOKEN budget, not a chunk count

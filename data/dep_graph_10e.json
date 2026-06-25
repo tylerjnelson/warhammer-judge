@@ -2,8 +2,8 @@
   "_meta": {
     "edition": "10e",
     "status": "ratified-v1",
-    "description": "Dependency graph (Layer 2 Track E): stem -> definition chunks the rule references but does not contain. Each rule chunk surfaced above threshold seeds + boosts these so the definitions it depends on ride into context with it. See spec/dependency-boost.md.",
-    "ratification": "v1 edges are the human-validated 'spine -> core siblings' families from tests/probe_essential_set.py ESSENTIAL and the pilot GROUND_TRUTH. tests/eval_dep_boost.py asserts these reproduce. Extend via scripts/build_dep_graph.py (draft) -> hand-ratify -> add here.",
+    "description": "Dependency graph: rule stem -> the definition rules it references but does not contain. Consumed by seed_definitions: a rule chunk that surfaces above threshold seeds these so the definitions it depends on ride into context with it.",
+    "ratification": "v1 edges are the human-validated 'spine -> core siblings' families. scripts/build_dep_graph.py gates that this ratified artifact reproduces them. Extend via scripts/build_dep_graph.py (draft) -> hand-ratify -> add here.",
     "invariant": "depth-1 only; a seeded dep does not recursively seed its own deps."
   },
   "charge_phase": ["charging_with_a_unit", "engagement_range", "unit_coherency"],
