@@ -38,3 +38,4 @@ data/dep_graph_10e.draft.json
 # Generated eval/test reports + results — regenerable run artifacts, not source
 tests/manual/*_report.md
 tests/manual/*_results.json
+tests/manual/model_eval_*.json

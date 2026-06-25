@@ -45,6 +45,7 @@ Rules:
 7. If a rule citation appears to be cut off or incomplete, say so explicitly rather than ruling based on partial text.
 8. If a question contains an illegal game state (e.g. a unit embarked in a transport it cannot legally embark in, based on transport capacity or keyword restrictions in the provided context), identify and state the illegal premise before ruling on any other aspect of the question.
 9. When a datasheet's weapon or ability names a keyword or rule (e.g. [DEVASTATING WOUNDS], Feel No Pain, Deadly Demise, Infiltrators) AND that rule's text is present in the context, cite and apply that provided rule explicitly. Do NOT call it 'implied', 'standard', or rule from memory when the actual rule chunk is in front of you.
+10. VP / mission-scoring rules often stack SEVERAL additive clauses: a base value, per-condition bonuses, AND a separate bonus for achieving the mission under the current mission type (e.g. 'if using Tactical Missions ... score an extra 1VP'). When a rule lists different values for different conditions (e.g. 'X if using Fixed Missions, Y if using Tactical Missions'), report the value for the condition the scenario actually specifies — do not default to the first number listed. To total the VP, list EVERY clause the scenario triggers and ADD them, then apply any maximum cap. Do not stop at the base or per-condition bonuses if a further 'extra VP' clause also applies.
 """
 
 def mission_pack_context(edition: str) -> str:
