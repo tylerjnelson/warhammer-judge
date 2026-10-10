@@ -1,0 +1,8 @@
+# Gitleaks config — used by the pre-commit hook (.githooks/pre-commit) and CI
+# (.github/workflows/gitleaks.yml). Extends the built-in ruleset; add
+# [[allowlists]] entries here for confirmed false positives rather than
+# disabling rules.
+title = "warhammer-judge gitleaks config"
+
+[extend]
+useDefault = true

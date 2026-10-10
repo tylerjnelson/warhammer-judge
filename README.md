@@ -38,3 +38,7 @@ A new edition shares no rules data with the current one, so each edition gets it
 ## Stack
 
 Streamlit · ChromaDB (local) · `sentence-transformers` embeddings + a local cross-encoder reranker · Groq-hosted LLM · SQLite for conversation history · data sourced from Wahapedia (CSV exports + an HTML scrape) through an incremental, self-reconciling ingest pipeline.
+
+## Secret scanning
+
+[Gitleaks](https://github.com/gitleaks/gitleaks) guards against committing credentials (e.g. the Groq API key, which belongs only in the gitignored `.env`). CI scans the full history on every push and PR (`.github/workflows/gitleaks.yml`); locally, enable the pre-commit hook once per clone with `git config core.hooksPath .githooks`. Config and false-positive allowlists live in `.gitleaks.toml`.
