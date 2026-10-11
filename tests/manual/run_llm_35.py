@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-run_llm_35.py — run the 35-question pool through the LIVE LLM (Groq qwen3-32b) with
-the real retrieval context, to inspect actual answers (not just retrieval).
+run_llm_35.py — run the 35-question pool through the LIVE LLM (Groq, the active
+`config.LLM_MODEL` — openai/gpt-oss-120b since 2026-07-21; qwen3-32b was retired when
+Groq closed it) with the real retrieval context, to inspect actual answers (not just retrieval).
 
 Mirrors render_chat's fresh-query path exactly: retrieve → unit slice + seed → rerank
 → assemble → inject_sequence_neighbors → call_llm. Writes a markdown transcript.
+(Model is read from config via serving.call_llm — this script is not pinned to any model.)
 
-TPM note: Groq free tier is 6K tokens/min (input+output, reasoning <think> billed too),
+TPM note: Groq free tier for gpt-oss-120b is 8K tokens/min (input+output, reasoning billed too),
 so calls are PACED (~--pace s apart) to avoid 429s. call_llm already auto-reduces on a
 rate-limit hit; reduced answers are flagged by the app itself.
 

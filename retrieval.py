@@ -123,6 +123,14 @@ def rerank(ctx: RetrievalContext) -> None:
                      ctx.main, ctx.rules, ctx.units)
 
 
+def boost_named_abilities(ctx: RetrievalContext) -> None:
+    """Correct the tiny cross-encoder's mis-scoring of a named unit's OWN abilities:
+    floor a unit-slice ability that names a query-named rules-keyword (Feel No Pain,
+    Deadly Demise, …) so it wins the unit's reserved slot. AFTER rerank, BEFORE assemble."""
+    import app
+    app.boost_named_ability_matches(ctx.query, ctx.units)
+
+
 def cap_seeded_below_parents(ctx: RetrievalContext) -> None:
     """Override each seeded dep's score to ride just below its reranked parent (the
     cross-encoder rates a dependency ~0). AFTER rerank, BEFORE assemble."""
@@ -157,6 +165,7 @@ PIPELINE = [
     scope_resolved,
     seed_dependencies,
     rerank,
+    boost_named_abilities,
     cap_seeded_below_parents,
     assemble,
     inject_sequence_neighbors,

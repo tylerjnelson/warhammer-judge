@@ -1,7 +1,7 @@
 """
 app.py — The Judge: Warhammer 40K Rules Adjudicator
 ====================================================
-Streamlit chat interface backed by ChromaDB RAG + Groq/Qwen LLM.
+Streamlit chat interface backed by ChromaDB RAG + Groq LLM (openai/gpt-oss-120b).
 
 Run:
   streamlit run app.py --server.port 8501
@@ -36,6 +36,9 @@ import config
 import indices
 import retrieval
 from chunk_model import Chunk, Provenance, content_key_text
+from applog import get_logger
+
+log = get_logger(__name__)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -59,7 +62,8 @@ def get_current_user() -> str:
         if user:
             return user
     except Exception:
-        pass
+        # Expected outside a script-run context (no request headers) — not a fault.
+        log.debug("get_current_user: no request headers available", exc_info=True)
     return "unknown"
 
 # ── ChromaDB (cached) ─────────────────────────────────────────────────────────
@@ -392,8 +396,7 @@ def retrieve(query: str, where: dict | None, edition: str, n_results: int = None
         # can never leak past its intended scope unnoticed.
         kwargs.pop("where", None)
         where_fell_back = True
-        import logging
-        logging.getLogger(__name__).warning(
+        log.warning(
             "retrieve(): where-clause rejected by Chroma; re-querying unfiltered and "
             "re-asserting the filter in-memory. where=%r", where)
         results = collection.query(**kwargs)
@@ -589,6 +592,8 @@ def retrieve_unit_slice(query: str, edition: str, mission_pack_mode: bool,
         try:
             res = collection.get(where=where, include=["documents", "metadatas"])
         except Exception:
+            log.warning("unit slice: lookup failed for unit=%r army=%r; unit omitted",
+                        unit, army, exc_info=True)
             continue
         for doc, meta in zip(res["documents"], res["metadatas"]):
             out.append(Chunk(text=doc, meta=meta, prov=Provenance.UNIT_SLICE, cosine=0.0))
@@ -646,6 +651,8 @@ def get_reranker():
         from sentence_transformers import CrossEncoder
         return CrossEncoder(config.RERANK_MODEL)
     except Exception:
+        log.error("reranker %s failed to load — ALL queries fall back to cosine ranking",
+                  config.RERANK_MODEL, exc_info=True)
         return None
 
 
@@ -828,6 +835,81 @@ def get_rule_name_index(edition: str):
         if stem:
             index.append((re.compile(rx, re.I), stem))
     return index
+
+
+# USR / core-ability surface forms a datasheet ABILITY grants or names, used by
+# boost_named_ability_matches to reserve the RIGHT ability of a named unit when the query
+# asks about that concept. DISTINCT from _USR_RULES on purpose: _USR_RULES resolves each
+# keyword to a seedable RULE chunk (get_rule_name_index), so a USR with no standalone rule
+# chunk (Lone Operative, Stealth, Firing Deck, Hover) silently drops out and never fires
+# the boost. This list needs NO rule chunk — it is pure query↔ability CONCEPT identity (the
+# same surface must appear in BOTH the query and the unit's ability text), so it covers the
+# full USR class. Curated for precision from a corpus audit of Ability-chunk text: every
+# entry actually appears on real datasheet abilities, and bare common English words
+# (heavy / assault / pistol / blast / fly / anti-) are deliberately EXCLUDED — they would
+# false-match a query. Extend as new askable abilities surface.
+_ABILITY_KEYWORD_SURFACES = [
+    r"\bfeel no pain\b",
+    r"\bdeep strike\b",
+    r"\bdeadly demise\b",
+    r"\bfights? first\b",
+    r"\blone operative\b",
+    r"\binfiltrators?\b",
+    r"\bscouts?\b",
+    r"\bstealth\b",
+    r"\bfiring deck\b",
+    r"\bhover\b",
+    r"\bleader\b",
+    r"\bprecision\b",
+    r"\bdevastating wounds\b",
+    r"\bsustained hits\b",
+    r"\blethal hits\b",
+    r"\bignores cover\b",
+    r"\bindirect fire\b",
+    r"\brapid fire\b",
+    r"\bhazardous\b",
+    r"\bbig guns never tire\b",
+    r"\bfall(?:s|ing)? back\b|\bfell back\b",
+    r"\bengagement range\b",
+    r"\bbattle.?shock(?:ed)?\b",
+]
+_ABILITY_KEYWORD_RES = [re.compile(p, re.I) for p in _ABILITY_KEYWORD_SURFACES]
+
+
+def boost_named_ability_matches(query: str, units: list) -> None:
+    """Lift a named unit's ABILITY chunk to the top of its unit's slice when the query
+    names a USR / core-ability concept (Feel No Pain, Deadly Demise, Lone Operative, …)
+    that the ability ALSO names, working around a demonstrable cross-encoder failure.
+
+    The tiny reranker (ms-marco-TinyBERT-L2-v2) mis-scores a unit's OWN abilities: for
+    "can the Painboy's Feel No Pain save against the Deadly Demise mortal wounds?" it rates
+    the offensive 'Hold Still and Say Aargh!' 0.96 (it shares the query's 'mortal wounds'
+    tokens) and the actual FNP-GRANTING 'Dok's Toolz' 0.01 — though Dok's Toolz literally
+    says "Feel No Pain 5+". (A bigger reranker doesn't fix it: MiniLM-L6 still ranks the
+    offense above the grant — the compound query's 'mortal wounds' tokens dominate the
+    operative 'Feel No Pain' clause.) So _reserve_unit_chunks reserved the wrong ability and
+    dropped the answer-bearing one. An explicit query↔ability CONCEPT match is a higher-
+    precision signal than any similarity score here, so floor the matched ability's rerank
+    above the reranker's false top — it then wins the unit's reserved slot AND the front tier
+    (assemble_context / _tier_unit_chunks rank by boosted_score). Generalizes to any multi-
+    ability character asked about a USR it grants.
+
+    Deliberately scoped so it can't misfire: only the UNIT SLICE (the named unit(s) the
+    query is actually about, not the dozens of other units whose generic 'Feel No Pain'
+    ability chunk sits in the dense pool) and only Ability chunks (a Datasheet stat-block
+    carries the unit's whole keyword cloud and would false-match). No-op when the query
+    names no keyword or no ability matches. Mutates in place; call AFTER rerank_pools (so it
+    overrides the reranked score) and BEFORE assemble_context."""
+    if not units:
+        return
+    q_concepts = [rx for rx in _ABILITY_KEYWORD_RES if rx.search(query)]
+    if not q_concepts:
+        return
+    for c in units:
+        if c["metadata"].get("category") != "Ability":
+            continue
+        if any(rx.search(c["text"]) for rx in q_concepts):
+            c["rerank"] = max(c.get("rerank") or 0.0, config.UNIT_KEYWORD_MATCH_FLOOR)
 
 
 def _gate_and_build(dep_parents: dict, dep_bridge: dict, seed: dict,
@@ -1154,6 +1236,8 @@ def fetch_sequence_neighbors(group: str, seq: int, edition: str) -> list[dict]:
             for doc, meta in zip(results["documents"], results["metadatas"])
         ]
     except Exception:
+        log.warning("sequence neighbors: lookup failed for group=%r seq=%r",
+                    group, seq, exc_info=True)
         return []
 
 def inject_sequence_neighbors(chunks: list, edition: str) -> list:
@@ -1206,10 +1290,13 @@ def get_dep_graph(edition: str) -> dict:
     Absent file ⇒ {} ⇒ the feature no-ops. Keys starting with '_' are metadata."""
     path = ROOT / config.RULES_DEP_GRAPH_PATH.format(edition=edition)
     if not path.exists():
+        log.info("dep graph absent for %s (%s); definition seeding disabled", edition, path)
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+        log.error("dep graph unreadable for %s (%s); definition seeding disabled",
+                  edition, path, exc_info=True)
         return {}
     return {k: v for k, v in raw.items() if not k.startswith("_")}
 
@@ -1273,7 +1360,7 @@ def init_session():
         get_reranker()
         get_embedder()
     except Exception:
-        pass
+        log.warning("model warm-up failed; first query will pay the cold load", exc_info=True)
 
 # ── Per-edition theming ───────────────────────────────────────────────────────
 

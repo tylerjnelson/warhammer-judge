@@ -13,7 +13,7 @@ load_dotenv()
 # ── LLM Provider ──────────────────────────────────────────────────────────────
 
 LLM_PROVIDER = "groq"                           # groq | gemini | deepseek | mistral
-LLM_MODEL    = "qwen/qwen3-32b"
+LLM_MODEL    = "openai/gpt-oss-120b"
 LLM_BASE_URL = "https://api.groq.com/openai/v1"
 LLM_API_KEY  = os.getenv("GROQ_API_KEY")
 
@@ -24,19 +24,27 @@ LLM_API_KEY  = os.getenv("GROQ_API_KEY")
 # NOT a per-request cap: multiple calls in the same minute SHARE the budget, and
 # every turn re-sends the system prompt + growing history, all of which counts.
 #
-#   qwen/qwen3-32b (active):  RPM 60 · RPD 1K · TPM 6K · TPD 500K
+#   openai/gpt-oss-120b (active):  RPM 30 · TPM 8K · TPD 200K
 #
-# qwen3-32b is a *reasoning* model: its <think> traces are billed as output
-# tokens against TPM even though app.py strips them before display — so part of
-# the 6K/min is spent on reasoning we discard. See spec/retrieval.md.
+# HISTORY (2026-07-21): the previous prod model `qwen/qwen3-32b` was RETIRED when
+# Groq CLOSED it on the free tier (usage no longer available). gpt-oss-120b was
+# the co-best model in every accuracy eval we ran (43/43, `model_eval_graded.md`)
+# and — unlike qwen3-32b — needs NO rule-10 prompt crutch to resolve Q12, so it
+# is the clean successor. qwen3-32b must not be reintroduced; it is unavailable.
 #
-# Recommended switches if TPM pressure / the reasoning tax becomes limiting
+# gpt-oss-120b is a *reasoning* model: its reasoning trace is billed as output
+# tokens against TPM even though app.py strips it before display — so part of the
+# 8K/min is spent on reasoning we discard. See spec/retrieval.md. Note gpt-oss's
+# TPM is higher than qwen's old 6K, but its 200K TPD is 2.5x LOWER — watch the
+# DAILY budget under sustained load.
+#
+# Recommended switches if TPM/TPD pressure or the reasoning tax becomes limiting
 # (config-only change — same Groq base_url; A/B quality on real queries first):
 #   llama-3.3-70b-versatile ............ TPM 12K · TPD 100K · instruct, no
-#       reasoning tax; 2x per-minute headroom but 5x lower daily cap.
+#       reasoning tax; but 100K TPD is fragile at eval scale (see §5 caveats).
 #   meta-llama/llama-4-scout-17b-16e-instruct  TPM 30K · TPD 500K · instruct;
-#       5x per-minute AND full daily headroom, quality a notch below the 70B.
-# Staying on qwen/qwen3-32b for now.
+#       most headroom, but lower accuracy (~39/43; flips FNP-vs-mortal-wounds).
+# Staying on openai/gpt-oss-120b.
 
 # ── Fallback (uncomment to switch) ───────────────────────────────────────────
 # LLM_PROVIDER = "gemini"
@@ -85,25 +93,84 @@ UNIT_SECOND_FLOOR    = 0.1   # ...but ONLY apply that ratio when the unit's best
                              # noise into a spurious drop — keep both (Snikrot top 0.027:
                              # ratio would drop his datasheet 0.004, losing the proof he
                              # has Infiltrators). 0.845 Abaddon stays above → ratio holds.
+UNIT_KEYWORD_MATCH_FLOOR = 0.99  # rerank floor for a named unit's ABILITY chunk when the
+                             # query names a rules-keyword (Feel No Pain, Deadly Demise,
+                             # Fights First, …) that the ability ALSO names. The tiny
+                             # cross-encoder demonstrably MIS-scores a unit's own abilities:
+                             # for "can the Painboy's Feel No Pain save …" it rates the
+                             # offensive 'Hold Still' 0.96 (shares the query's 'mortal
+                             # wounds' tokens) and the actual FNP-GRANTING 'Dok's Toolz'
+                             # 0.01 (which literally says "Feel No Pain 5+"), so the unit
+                             # slice reserved the wrong ability and dropped the answer. An
+                             # explicit query↔ability keyword match is higher-precision than
+                             # the reranker, so floor the matched ability above the reranker's
+                             # false top (0.96) → it wins the unit's reserved slot + front
+                             # tier. Scoped to the unit slice + Ability chunks (see
+                             # boost_named_ability_matches), so it can't promote the dozens
+                             # of OTHER units' generic 'Feel No Pain' chunks in the dense pool.
 REST_GATE            = 0.0   # rerank floor for DISCRETIONARY (non-reserved) fill chunks,
                              # so spare budget isn't packed with low-relevance noise.
                              # Tunable; 0.0 = current behavior (off).
 SIMILARITY_THRESHOLD = 0.3   # discard chunks below this cosine similarity (lowered
                              # 0.35→0.3 to widen the candidate pool the reranker sorts)
 
-# Completion cap (passed as max_completion_tokens). Counts against the 6K/min TPM
-# ceiling AND includes the reasoning model's <think> tokens (billed even though we
-# strip them before display). Measured: a complex adjudication completes naturally at
-# ~1.3-1.4K completion tokens; at 1000 it truncated mid-<think> (finish_reason=length),
-# returning a cut-off trace with no ruling. The active model (qwen3-32b) never
-# truncated at 2048, but the eval sweep (2026-06-24) found two reasoning-heavy
-# alternates — qwen3.6-27b and gpt-oss-20b — burning the whole 2048 budget inside
-# <think> and returning EMPTY (finish_reason=length). Raised to 3072 to give those
-# models room to finish so the model comparison isn't confounded by truncation.
-# Per-call TPM stays under the 6K ceiling on a typical ~2800-tok context (≈5.9K);
-# only the rare worst-case context (~3667 tok) gets tight, where call_llm_reduced
-# already retries. Input still dominates TPM, so the +1024 adds little per-call cost.
-MAX_OUTPUT_TOKENS  = 3072
+# ── Production sends NO completion cap ────────────────────────────────────────
+# DECISION (2026-07-04): production OMITS max_completion_tokens entirely. The decision
+# is model-agnostic and still governs the current prod model (openai/gpt-oss-120b, TPM
+# 8000); the measurements below were taken live against the then-prod model (retired
+# qwen/qwen3-32b, TPM limit 6000) — the mechanics (admission-reservation) are identical:
+#   • The cap is ADMISSION-RESERVED, not billed-only. The server reserves
+#     (input + max_completion_tokens) against the 6000/min TPM wall BEFORE generating and
+#     413s if that reservation exceeds 6000. So a cap of 3072 made 7/43 real questions
+#     (input 2900-3300 tok) 413 → call_llm_reduced SHED context; 8192 413s EVERY call.
+#     Consumption still bills only actual generated tokens — the RESERVATION is the harm.
+#   • OMITTING the cap reserves the INPUT ONLY. Proved: a no-cap call dropped remaining-
+#     tokens by just the ~33 input tokens at admission; the two worst 413'ers (Q21
+#     input=3406, Q40 input=3172) both ADMIT and finish=stop with no cap. So dropping the
+#     cap ELIMINATES the output-413/shed class — full context always reaches the model —
+#     and leaves nothing to truncate: finish=length can now only occur at the model's ~40K
+#     context window, which a rules answer never approaches (longest ever seen: 1383 tok).
+#   • The cap's ONLY real benefit was a runaway-reasoning hard stop (gpt-oss-120b is a
+#     heavier reasoner than the old qwen3-32b, so this matters more now, not less). That
+#     backstop is now a wall-clock LLM_REQUEST_TIMEOUT, which bounds a pathological loop
+#     WITHOUT reserving any TPM at admission.
+# See spec/free-llm-providers.md §5c.
+#
+# MAX_OUTPUT_TOKENS is retained ONLY for the EVAL harnesses (collect_model_answers.py,
+# run_llm_35.py): when fanning the question set across reasoning ALTERNATES (qwen3.6-27b,
+# gpt-oss-20b) a cap usefully bounds their <think>. Production (serving._complete) does NOT
+# read it. Bump it in the harness if an alternate needs room — it never touches prod.
+MAX_OUTPUT_TOKENS  = 2048   # EVAL-HARNESS ONLY; production omits max_completion_tokens
+
+# Wall-clock ceiling (seconds) on ONE completion HTTP request — the runaway backstop that
+# replaces the output cap. Legitimate reasoning answers finish well under this (measured
+# generation ≤ ~80s incl. <think>); a large value only catches a pathological loop that
+# would otherwise run to the model's context window. Passed to the OpenAI client
+# (serving.get_llm_client). Bounds one HTTP request only; the reset-aware 429 sleep is
+# separate and additive.
+LLM_REQUEST_TIMEOUT = 240
+
+# ── Reset-aware 429 handling (serving.call_llm) ───────────────────────────────
+# A 429 rate_limit_exceeded is transient: it costs no generated tokens and the token
+# bucket refills within the minute, so the correct move on a per-minute (TPM) breach is
+# to WAIT the reset window and retry the FULL request — preserving context/quality —
+# rather than shedding context up front. The server tells us EXACTLY how long: serving
+# reads the reset from the 429 headers and waits the MAX of (x-ratelimit-reset-tokens,
+# retry-after) plus a small margin, so we never retry BEFORE the bucket actually refills
+# (which would just earn another 429). We never guess and never wait a blind full minute.
+#
+# The reported reset is also an exact TPM-vs-TPD discriminator: a per-minute token bucket
+# physically refills in ≤~60s, so any reset ≤ RATE_LIMIT_MAX_WAIT is a real TPM breach we
+# wait out; a larger reset is the DAILY (TPD) cap (hundreds of seconds) → fall through to
+# context-shedding / a clear message so a live user is never blocked for minutes.
+# MEASURED (2026-07-04, a live TPM 429): reset-tokens=40.47s, retry-after=21s,
+# remaining-tokens=1953/6000 — a real per-minute reset is TENS of seconds, NOT the 1-9s
+# the plan assumed, so MAX_WAIT is set to a full minute window (60) to wait out any TPM
+# breach rather than shed it. See spec/free-llm-providers.md §5b. NOTE: the SDK default
+# max_retries silently masks 429s as multi-second hangs and hides the reset headers, so
+# serving.get_llm_client sets max_retries=0 — we own the wait and read the reset ourselves.
+RATE_LIMIT_MAX_WAIT = 60   # reset ceiling: wait out any TPM breach (≤~60s); shed the daily cap
+RATE_LIMIT_RETRIES  = 1    # full-context wait-and-retry attempts on a bounded (TPM) 429
 
 # ── Per-call token budget (Layer 2) ───────────────────────────────────────────
 # The real cap on what reaches the model is a TOKEN budget, not a chunk count
@@ -385,8 +452,11 @@ def default_edition() -> str:
 #         UNIT_SECOND_RATIO of the unit's best AND that best ≥ UNIT_SECOND_FLOOR
 #         (FLOOR ≤ RATIO by construction). REST_GATE floors discretionary fill.
 #   SERVING (format_rules_context / build_messages / call_llm)
-#       RULES_CONTEXT_TOKEN_BUDGET is the SOFT hard-ceiling; MAX_HISTORY_MESSAGES +
-#         MAX_OUTPUT_TOKENS + the 6K/min TPM ceiling bound per-call cost.
+#       RULES_CONTEXT_TOKEN_BUDGET is the SOFT hard-ceiling; MAX_HISTORY_MESSAGES bounds
+#         re-sent history. Production sends NO output cap (see above) — LLM_REQUEST_TIMEOUT
+#         is the runaway backstop; MAX_OUTPUT_TOKENS is eval-harness-only. On a 429,
+#         RATE_LIMIT_MAX_WAIT/RATE_LIMIT_RETRIES wait a bounded TPM reset and retry
+#         full-context; a large (daily) reset sheds context instead of blocking.
 
 def assert_invariants() -> None:
     """Codify the relationships the tuning relies on, so a nudge that breaks an assumed
@@ -400,6 +470,7 @@ def assert_invariants() -> None:
         ("0 <= UNIT_SECOND_FLOOR <= 1",        0 <= UNIT_SECOND_FLOOR <= 1),
         ("UNIT_SECOND_FLOOR <= UNIT_SECOND_RATIO (else the floor never bites)",
                                                UNIT_SECOND_FLOOR <= UNIT_SECOND_RATIO),
+        ("0 < UNIT_KEYWORD_MATCH_FLOOR <= 1",  0 < UNIT_KEYWORD_MATCH_FLOOR <= 1),
         ("0 < SPAN_GATE_MIN < 1",              0 < SPAN_GATE_MIN < 1),
         ("0 < REFERENCED_PARENT_MIN < 1",      0 < REFERENCED_PARENT_MIN < 1),
         ("RULES_BOOST_DEP > 0 (a dep must ride strictly below its parent)",

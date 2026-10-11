@@ -19,6 +19,7 @@ Can also be run manually:
 
 import sys
 import re
+import json
 import hashlib
 import shutil
 import argparse
@@ -36,6 +37,7 @@ import config
 
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+STATUS_FILE = LOG_DIR / "watcher_status.json"
 
 # Per-edition locals (base_url / csv_dir / archive_dir / hash_file) are resolved
 # inside run() from config.get_edition(code) for each active edition.
@@ -67,6 +69,30 @@ def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
+class SyncError(Exception):
+    """A step failed for one edition. Raised instead of sys.exit so run() can record
+    it and still service the remaining editions (a 10e network error must not skip 11e)."""
+
+def log_stderr(code, step, result):
+    """Always surface a child's stderr — warnings on a successful run used to be dropped."""
+    if result.stderr.strip():
+        log(f"[{code}] {step} stderr:\n{result.stderr.strip()}")
+
+def write_status(code, ok, detail):
+    """Record this run per edition in logs/watcher_status.json. last_success only moves
+    on a clean run, so a stale value there is the signal that syncing has been failing."""
+    try:
+        status = json.loads(STATUS_FILE.read_text()) if STATUS_FILE.exists() else {}
+    except (OSError, ValueError):
+        status = {}
+    now   = datetime.now().isoformat(timespec="seconds")
+    entry = status.get(code, {})
+    entry.update(last_run=now, last_result="ok" if ok else "error", detail=detail)
+    if ok:
+        entry["last_success"] = now
+    status[code] = entry
+    STATUS_FILE.write_text(json.dumps(status, indent=2) + "\n")
+
 def md5(content: bytes) -> str:
     return hashlib.md5(content).hexdigest()
 
@@ -88,8 +114,7 @@ def fetch_remote_hash(base_url, code) -> tuple[str, bytes]:
         resp.raise_for_status()
         return md5(resp.content), resp.content
     except requests.RequestException as e:
-        log(f"[{code}] [ERROR] Failed to fetch Last_update.csv: {e}")
-        sys.exit(1)
+        raise SyncError(f"Failed to fetch Last_update.csv: {e}") from e
 
 # ── Archive ───────────────────────────────────────────────────────────────────
 
@@ -127,10 +152,11 @@ def download_csvs(base_url, csv_dir, code):
 
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
-def run_scrape(code) -> bool:
+def run_scrape(code) -> tuple[bool, bool]:
     """
     Scrape the edition's Core Rules and mission-pack HTML pages.
-    Returns True if any files were written (i.e. content changed).
+    Returns (changed, fetch_failed): changed = any files written; fetch_failed = the
+    scraper exited 2 (a page couldn't be fetched — HTML not refreshed this run).
     """
     log(f"[{code}] Scraping rules pages...")
     result = subprocess.run(
@@ -141,14 +167,20 @@ def run_scrape(code) -> bool:
     )
     if result.stdout:
         log(result.stdout.strip())
-    if result.returncode != 0:
-        log(f"[{code}] [ERROR] Scraper failed:\n{result.stderr}")
-        sys.exit(1)
+    # Always surface stderr — fetch errors used to be printed there with exit 0,
+    # so 60 nights of DNS failures logged as a harmless "0 written, 0 skipped".
+    log_stderr(code, "scraper", result)
+    if result.returncode == 2:
+        # Fetch failure (network/HTTP): HTML pages are stale this run, but the CSV
+        # path is independent, so warn and continue rather than abort.
+        log(f"[{code}] [WARN] Scraper could not fetch one or more pages — HTML rules not refreshed this run")
+    elif result.returncode != 0:
+        raise SyncError(f"Scraper failed (exit {result.returncode})")
 
     # Parse written count from output: "Scrape complete: N written, M skipped"
     match = re.search(r"(\d+) written", result.stdout)
     written = int(match.group(1)) if match else 0
-    return written > 0
+    return written > 0, result.returncode == 2
 
 def run_etl(code):
     log(f"[{code}] Running ETL pipeline...")
@@ -160,9 +192,9 @@ def run_etl(code):
     )
     if result.stdout:
         log(result.stdout.strip())
+    log_stderr(code, "ETL", result)
     if result.returncode != 0:
-        log(f"[{code}] [ERROR] ETL failed:\n{result.stderr}")
-        sys.exit(1)
+        raise SyncError(f"ETL failed (exit {result.returncode})")
 
 def run_ingest(code):
     log(f"[{code}] Running ingest pipeline...")
@@ -174,9 +206,9 @@ def run_ingest(code):
     )
     if result.stdout:
         log(result.stdout.strip())
+    log_stderr(code, "ingest", result)
     if result.returncode != 0:
-        log(f"[{code}] [ERROR] Ingest failed:\n{result.stderr}")
-        sys.exit(1)
+        raise SyncError(f"Ingest failed (exit {result.returncode})")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -187,13 +219,28 @@ def run(force=False):
     # Service every active edition in turn. Inactive editions (e.g. 11e until
     # release) are absent from active_editions(), so the loop skips them with no
     # code change needed at launch — only the config flag flips.
+    failed = []
     for code in config.active_editions():
-        sync_edition(code, force=force)
+        try:
+            detail = sync_edition(code, force=force)
+            write_status(code, True, detail)
+        except SyncError as e:
+            log(f"[{code}] [ERROR] {e} — edition skipped, last good state preserved")
+            write_status(code, False, str(e))
+            failed.append(code)
+        except Exception as e:                  # unexpected bug: record it, keep going
+            log(f"[{code}] [ERROR] Unexpected {type(e).__name__}: {e}")
+            write_status(code, False, f"unexpected {type(e).__name__}: {e}")
+            failed.append(code)
 
+    log(f"Watcher finished: {'FAILED for ' + ', '.join(failed) if failed else 'all editions OK'}")
     log("=" * 50)
+    if failed:
+        sys.exit(1)
 
 def sync_edition(code, force=False):
-    """Run the full change-detection + pipeline for a single edition."""
+    """Run the full change-detection + pipeline for a single edition. Returns a short
+    outcome string for the status file; raises SyncError on any failed step."""
     ed          = config.get_edition(code)
     base_url    = ed["wahapedia_base"]
     csv_dir     = ROOT / ed["csv_dir"]
@@ -205,7 +252,7 @@ def sync_edition(code, force=False):
     # ── Step 1: Always scrape HTML rules pages ──
     # Last_update.csv has no awareness of HTML page changes.
     # The scraper's own manifest detects actual content changes cheaply.
-    scrape_changed = run_scrape(code)
+    scrape_changed, scrape_failed = run_scrape(code)
 
     # ── Step 2: Check Wahapedia CSV exports for changes ──
     new_hash, _  = fetch_remote_hash(base_url, code)
@@ -222,7 +269,9 @@ def sync_edition(code, force=False):
     # ── Step 3: Exit early if nothing changed anywhere ──
     if not csv_changed and not scrape_changed:
         log(f"[{code}] No changes detected anywhere. Skipping.")
-        return
+        if scrape_failed:
+            raise SyncError("HTML rules page fetch failed (CSV check OK, no CSV changes)")
+        return "no changes"
 
     # ── Step 4: If CSVs changed, run full download + ETL ──
     if csv_changed:
@@ -231,8 +280,7 @@ def sync_edition(code, force=False):
         log(f"[{code}] Downloading CSVs from Wahapedia...")
         success = download_csvs(base_url, csv_dir, code)
         if not success:
-            log(f"[{code}] [ERROR] Some CSVs failed to download. Aborting to preserve last good state.")
-            sys.exit(1)
+            raise SyncError("Some CSVs failed to download; aborted to preserve last good state")
 
         run_etl(code)
 
@@ -245,6 +293,12 @@ def sync_edition(code, force=False):
         log(f"[{code}] CSV hash updated to {new_hash[:8]}...")
 
     log(f"[{code}] Sync complete.")
+    if scrape_failed:
+        # CSV work above is done and kept; still record the edition as failed so a
+        # broken rules-page fetch can't hide behind a healthy CSV sync.
+        raise SyncError("HTML rules page fetch failed (CSV sync completed)")
+    return "synced (" + ", ".join(
+        [x for x, on in (("csv", csv_changed), ("html", scrape_changed)) if on]) + ")"
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

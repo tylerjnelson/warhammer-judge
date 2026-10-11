@@ -5,7 +5,14 @@ conditional-value failures found in §5a (Q11/Q12: wrong Fixed-vs-Tactical branc
 dropped Tactical +1). Reuses the stored rules context per question (no pipeline rerun),
 so the only variable is the system prompt. Includes regression controls.
 
-Usage: python tests/manual/test_prompt_fix.py
+*** RETIRED / HISTORICAL (2026-07-21): this A/B was run against qwen/qwen3-32b, which Groq
+has since CLOSED on the free tier — the hardcoded model below is no longer callable, so this
+script will error if re-run as-is. It is kept only as the record of how the shipped rule-10
+system-prompt rule was validated. The current prod model (openai/gpt-oss-120b) resolves Q12
+NATIVELY and never needed this crutch, so there is nothing to re-A/B; do not repoint this at
+gpt-oss-120b expecting the same failure. ***
+
+Usage (historical): python tests/manual/test_prompt_fix.py
 """
 import json, re, sys, time
 from pathlib import Path
@@ -15,7 +22,7 @@ import config, serving
 from openai import OpenAI
 
 EDITION = "10e"
-FAILED   = [11, 12]          # the two qwen3-32b missed
+FAILED   = [11, 12]          # the two qwen3-32b missed (qwen3-32b retired 2026-07-21)
 CONTROLS = [13, 19, 39]      # branching/conditional Qs it already PASSED — must not regress
 
 # Candidate new rule (appended as rule 10).

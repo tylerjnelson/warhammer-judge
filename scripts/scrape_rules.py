@@ -884,22 +884,28 @@ def run(pages=("core_rules", "mission_pack"), force=False, edition="10e"):
     total_skipped  = 0
 
     total_removed  = 0
+    failed         = []   # page keys whose fetch failed — reported, never silently zeroed
 
     for key in pages:
         page_config = all_pages[key]
         print(f"Scraping {key} from {page_config['url']}...")
         written, skipped, emitted = scrape_page(key, page_config, manifest, blocks_dir, force)
+        if emitted is None:
+            # Fetch failed: nothing written, sweep skipped (a network blip must not
+            # wipe the corpus). Say so on stdout too — "0 written, 0 skipped" alone
+            # is indistinguishable from a healthy no-op in the watcher log.
+            print(f"  {key}: [ERROR] FETCH FAILED — no files written, sweep skipped")
+            failed.append(key)
+            continue
         # Sweep orphaned sections for THIS page only — a heading the page no longer
-        # carries leaves a stale {prefix}_{slug}.md behind. Skip the sweep when the
-        # fetch failed (emitted is None) so a network blip can't wipe the corpus.
+        # carries leaves a stale {prefix}_{slug}.md behind.
         removed = 0
-        if emitted is not None:
-            prefix = page_config["prefix"]
-            for f in blocks_dir.glob(f"{prefix}_*.md"):
-                if f.name not in emitted:
-                    f.unlink()
-                    manifest.pop(f.name, None)
-                    removed += 1
+        prefix = page_config["prefix"]
+        for f in blocks_dir.glob(f"{prefix}_*.md"):
+            if f.name not in emitted:
+                f.unlink()
+                manifest.pop(f.name, None)
+                removed += 1
         print(f"  {key}: {written} written, {skipped} skipped, {removed} swept")
         total_written += written
         total_skipped += skipped
@@ -908,7 +914,9 @@ def run(pages=("core_rules", "mission_pack"), force=False, edition="10e"):
     save_manifest(manifest_path, manifest)
     print(f"\nScrape complete: {total_written} written, {total_skipped} skipped (unchanged), "
           f"{total_removed} orphan blocks swept")
-    return total_written, total_skipped
+    if failed:
+        print(f"[ERROR] {len(failed)} page(s) failed to fetch: {', '.join(failed)}")
+    return total_written, total_skipped, failed
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -930,4 +938,7 @@ if __name__ == "__main__":
     else:
         pages = ("core_rules", "mission_pack")
 
-    run(pages=pages, force=args.force, edition=args.edition)
+    _, _, failed = run(pages=pages, force=args.force, edition=args.edition)
+    # Exit 2 = partial/total fetch failure (distinct from 1 = crash), so callers
+    # like watcher.py can warn without aborting the independent CSV path.
+    sys.exit(2 if failed else 0)

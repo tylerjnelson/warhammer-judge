@@ -39,14 +39,17 @@ OUT_MD   = Path(__file__).resolve().parent / "model_eval_report.md"
 # Chat-capable text models on our Groq key. Excludes audio (whisper/orpheus),
 # the prompt-guard / gpt-oss-safeguard classifiers (not Q&A models).
 MODELS = [
-    "qwen/qwen3-32b",          # current PROD
+    "openai/gpt-oss-120b",     # current PROD (since 2026-07-21)
     "qwen/qwen3.6-27b",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "meta-llama/llama-4-scout-17b-16e-instruct",
-    "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "allam-2-7b",
+    # RETIRED — no longer callable:
+    #   qwen/qwen3-32b  → Groq CLOSED it on the free tier (2026-07-21). Was prod until then;
+    #                     removed from the fan-out because the API now rejects it. Historical
+    #                     scores live in model_eval_graded.md / model_eval_uncapped.md.
     # EXCLUDED — not viable grounded-RAG backends (verified 2026-06-24):
     #   groq/compound       → 413 Request Entity Too Large on our ~2800-tok context
     #                         (agentic tool-definition overhead leaves no room).
@@ -55,6 +58,39 @@ MODELS = [
     #                         429s under load and adds nothing distinct.
 ]
 MAX_OUT = config.MAX_OUTPUT_TOKENS
+
+# ── Output-cap mode (set by CLI) ──────────────────────────────────────────────
+# "fixed": uniform MAX_OUT (original behavior).
+# "omit" : send no max_completion_tokens — BUT Groq then applies a per-model DEFAULT
+#          (measured: qwen3.6-27b defaults to 2048 and truncates), so this is NOT "no limit".
+# "tpm"  : per-model cap sized to each model's TPM so a legit answer never truncates yet the
+#          call still ADMITS (admission reserves input+cap against the model's TPM; input
+#          tops ~3400 in this set). This is the "no artificial truncation" run.
+CAP_MODE = "fixed"
+
+# Measured per-model TPM (2026-07-04): 6000 = llama3.1-8b/allam, 8000 = qwen3.6-27b/
+# gpt-oss-120b/gpt-oss-20b, 12000 = llama3.3-70b, 30000 = llama4-scout. Cap ≈ TPM − ~3400 input
+# headroom, capped at 8192; the reasoners' real worst-case needs (qwen3.6 ~2878, gpt-oss-20b
+# ~1916) sit well under these, so nothing truncates. (qwen3-32b, retired 2026-07-21, was 6000.)
+PER_MODEL_CAP = {
+    "llama-3.1-8b-instant":                      2560,   # 6000 TPM (short instruct answers)
+    "allam-2-7b":                                2560,   # 6000 TPM
+    "qwen/qwen3.6-27b":                          4096,   # 8000 TPM (real max need ~2878)
+    "openai/gpt-oss-120b":                       4096,   # 8000 TPM
+    "openai/gpt-oss-20b":                        4096,   # 8000 TPM (real max need ~1916)
+    "llama-3.3-70b-versatile":                   8192,   # 12000 TPM
+    "meta-llama/llama-4-scout-17b-16e-instruct": 8192,   # 30000 TPM
+}
+DEFAULT_ROOM_CAP = 2560   # unlisted model → assume the tightest (6000 TPM) tier
+
+
+def _cap_for(model):
+    """The max_completion_tokens to send for this model, per CAP_MODE. None = omit."""
+    if CAP_MODE == "omit":
+        return None
+    if CAP_MODE == "tpm":
+        return PER_MODEL_CAP.get(model, DEFAULT_ROOM_CAP)
+    return MAX_OUT
 
 
 def strip_reasoning(raw: str) -> str:
@@ -69,10 +105,11 @@ def ask(client, model, messages):
     for attempt in range(MAX_ATTEMPTS):
         t0 = time.time()
         try:
-            r = client.chat.completions.create(
-                model=model, messages=messages,
-                max_completion_tokens=MAX_OUT, temperature=0.1,
-            )
+            kw = {"model": model, "messages": messages, "temperature": 0.1}
+            cap = _cap_for(model)
+            if cap is not None:
+                kw["max_completion_tokens"] = cap
+            r = client.chat.completions.create(**kw)
             raw = r.choices[0].message.content or ""
             return {
                 "answer": strip_reasoning(raw), "raw_len": len(raw),
@@ -104,7 +141,9 @@ def build_report(data):
     lines = [f"# Model answer collection — {len(MODELS)} models",
              f"\nGroq models: {', '.join(MODELS)}",
              f"\nPipeline: retrieval.build_context → serving.build_messages (budget {BUDGET} tok). "
-             f"max_completion_tokens={MAX_OUT}, temperature=0.1. Reasoning `<think>` stripped from answers.",
+             f"cap_mode={CAP_MODE}"
+             f"{' (per-model TPM-sized: '+', '.join(f'{k.split(chr(47))[-1]}={v}' for k,v in PER_MODEL_CAP.items())+')' if CAP_MODE=='tpm' else f' (max_completion_tokens={MAX_OUT})' if CAP_MODE=='fixed' else ' (omitted → Groq per-model default)'}, "
+             f"temperature=0.1. Reasoning `<think>` stripped from answers.",
              "\n⚠ groq/compound[-mini] are agentic (may use tools/web), not pure grounded Q&A.\n"]
     for q in data["questions"]:
         lines.append("\n" + "=" * 100)
@@ -137,9 +176,14 @@ def main():
     ap.add_argument("--pace", type=float, default=0.0, help="seconds to sleep between questions")
     ap.add_argument("--out", default="", help="output filename stem (default model_eval_results); "
                                               "use a distinct stem to keep a prior run's baseline intact")
+    ap.add_argument("--no-cap", action="store_true",
+                    help="omit max_completion_tokens (mirror prod; Groq applies a per-model default)")
+    ap.add_argument("--tpm-room", action="store_true",
+                    help="per-model cap sized to each model's TPM so no legit answer truncates")
     args = ap.parse_args()
 
-    global MODELS, OUT_JSON, OUT_MD
+    global MODELS, OUT_JSON, OUT_MD, CAP_MODE
+    CAP_MODE = "tpm" if args.tpm_room else "omit" if args.no_cap else "fixed"
     if args.models:
         MODELS = [m.strip() for m in args.models.split(",") if m.strip()]
     if args.out:
@@ -200,7 +244,8 @@ def main():
 
         # checkpoint after each question (drop the non-serializable messages).
         # Preserve the full model roster in meta even on a restricted backfill run.
-        save = {"meta": {**data.get("meta", {}), "budget": BUDGET, "max_out": MAX_OUT},
+        save = {"meta": {**data.get("meta", {}), "budget": BUDGET, "max_out": MAX_OUT,
+                         "cap_mode": CAP_MODE},
                 "questions": [{k: v for k, v in qq.items() if k != "_messages"}
                               for qq in data["questions"]]}
         OUT_JSON.write_text(json.dumps(save, indent=1))
