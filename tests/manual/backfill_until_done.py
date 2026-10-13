@@ -28,14 +28,14 @@ from openai import OpenAI
 # meter with the per-minute bucket still full; gpt-oss-20b usually finishes same-day).
 OUT_STEM = "model_eval_uncapped"
 # gpt-oss-120b/gpt-oss-20b/qwen3.6-27b reached 43/43 after overnight daily-cap rollover.
-# Remaining straggler: llama-3.3-70b (100K TPD < ~127K needed for 43 Qs, so ≤~34/day — needs
-# a multi-day harvest). allam-2-7b's 6 gaps are structural 413s (context window), uncollectable.
-MODELS  = ["llama-3.3-70b-versatile"]
+# llama-3.3-70b (the old straggler) is no longer served by Groq. Retargeted 2026-10-11 at
+# qwen/qwen3.8-27b (200K TPD). allam-2-7b's gaps are structural 413s (context window).
+MODELS  = ["qwen/qwen3.8-27b"]
 RESULTS = ROOT / f"tests/manual/{OUT_STEM}.json"
 TARGET  = 43
 PROBE_TOKENS    = 3000          # real-sized: a tiny probe passes on a sliver of daily budget (misleading)
 IDLE_SLEEP      = 1800          # 30 min between probes while daily-capped
-DEADLINE_HRS    = 48          # llama-3.3-70b needs ~1.5 days (100K TPD < ~127K for 43 Qs)
+DEADLINE_HRS    = 48          # a 200K-TPD reasoner can still straddle a daily rollover
 
 client = OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL, max_retries=0)
 

@@ -12,8 +12,13 @@ load_dotenv()
 
 # ── LLM Provider ──────────────────────────────────────────────────────────────
 
-LLM_PROVIDER = "groq"                           # groq | gemini | deepseek | mistral
+LLM_PROVIDER = "groq"
 LLM_MODEL    = "openai/gpt-oss-120b"
+# Automatic failover (serving._call_llm): when the primary can't serve a request — 429
+# not waitable (daily cap / retries spent), model gone (404), or a provider 5xx — the
+# request is retried at FULL context on the backup before any context is shed. Each Groq
+# model has its own rate-limit bucket, so this is a real second budget. None disables it.
+LLM_BACKUP_MODEL = "qwen/qwen3.8-27b"
 LLM_BASE_URL = "https://api.groq.com/openai/v1"
 LLM_API_KEY  = os.getenv("GROQ_API_KEY")
 
@@ -38,25 +43,17 @@ LLM_API_KEY  = os.getenv("GROQ_API_KEY")
 # TPM is higher than qwen's old 6K, but its 200K TPD is 2.5x LOWER — watch the
 # DAILY budget under sustained load.
 #
-# Recommended switches if TPM/TPD pressure or the reasoning tax becomes limiting
-# (config-only change — same Groq base_url; A/B quality on real queries first):
-#   llama-3.3-70b-versatile ............ TPM 12K · TPD 100K · instruct, no
-#       reasoning tax; but 100K TPD is fragile at eval scale (see §5 caveats).
-#   meta-llama/llama-4-scout-17b-16e-instruct  TPM 30K · TPD 500K · instruct;
-#       most headroom, but lower accuracy (~39/43; flips FNP-vs-mortal-wounds).
-# Staying on openai/gpt-oss-120b.
-
-# ── Fallback (uncomment to switch) ───────────────────────────────────────────
-# LLM_PROVIDER = "gemini"
-# LLM_MODEL    = "gemini-2.5-flash"
-# LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-# LLM_API_KEY  = os.getenv("GEMINI_API_KEY")
-
-# ── Alt fallback ──────────────────────────────────────────────────────────────
-# LLM_PROVIDER = "deepseek"
-# LLM_MODEL    = "deepseek-chat"
-# LLM_BASE_URL = "https://api.deepseek.com/v1"
-# LLM_API_KEY  = os.getenv("DEEPSEEK_API_KEY")
+# BACKUP (2026-10-12): qwen/qwen3.8-27b — RPM 30 · RPD 1K · TPD 200K, but its per-minute
+#   limit is SPLIT: ITPM 7K + OTPM 1K (measured 2026-10-11; the docs' "TPM 8K" is not what
+#   is enforced). An OTPM 429 is an admission-time output ESTIMATE reject with no usable
+#   reset → serving backs off OTPM_BACKOFF instead. No <think> trace (fast, ~400-tok
+#   answers). Graded 40/43 (tests/manual/model_eval_qwen38): misses Q12 VP math, over-
+#   refuses Q20/Q31 under prompt rules 4/6 — good enough as a failover, not as primary.
+#
+# RETIRED (2026-10-12): every other model. Groq no longer serves qwen3.6-27b,
+# llama-3.3-70b, llama-3.1-8b or llama-4-scout; gpt-oss-20b, allam-2-7b and the
+# Gemini / DeepSeek cross-provider fallbacks were dropped from the roster on purpose
+# (gpt-oss-120b + qwen3.8-27b only). History: spec/free-llm-providers.md.
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 
@@ -137,9 +134,8 @@ SIMILARITY_THRESHOLD = 0.3   # discard chunks below this cosine similarity (lowe
 # See spec/free-llm-providers.md §5c.
 #
 # MAX_OUTPUT_TOKENS is retained ONLY for the EVAL harnesses (collect_model_answers.py,
-# run_llm_35.py): when fanning the question set across reasoning ALTERNATES (qwen3.6-27b,
-# gpt-oss-20b) a cap usefully bounds their <think>. Production (serving._complete) does NOT
-# read it. Bump it in the harness if an alternate needs room — it never touches prod.
+# run_llm_35.py) in their default fixed-cap mode; prefer --no-cap (mirrors prod) or
+# --tpm-room for model comparisons. Production (serving._complete) does NOT read it.
 MAX_OUTPUT_TOKENS  = 2048   # EVAL-HARNESS ONLY; production omits max_completion_tokens
 
 # Wall-clock ceiling (seconds) on ONE completion HTTP request — the runaway backstop that
@@ -155,9 +151,10 @@ LLM_REQUEST_TIMEOUT = 240
 # bucket refills within the minute, so the correct move on a per-minute (TPM) breach is
 # to WAIT the reset window and retry the FULL request — preserving context/quality —
 # rather than shedding context up front. The server tells us EXACTLY how long: serving
-# reads the reset from the 429 headers and waits the MAX of (x-ratelimit-reset-tokens,
-# retry-after) plus a small margin, so we never retry BEFORE the bucket actually refills
-# (which would just earn another 429). We never guess and never wait a blind full minute.
+# reads the reset from the 429 headers and waits it plus a small margin, so we never retry
+# BEFORE the request fits (which would just earn another 429). Which header: the shorter
+# retry-after for models in RETRY_AFTER_TRUSTED (measured safe), otherwise the MAX of
+# (x-ratelimit-reset-tokens, retry-after). We never guess and never wait a blind minute.
 #
 # The reported reset is also an exact TPM-vs-TPD discriminator: a per-minute token bucket
 # physically refills in ≤~60s, so any reset ≤ RATE_LIMIT_MAX_WAIT is a real TPM breach we
@@ -171,6 +168,22 @@ LLM_REQUEST_TIMEOUT = 240
 # serving.get_llm_client sets max_retries=0 — we own the wait and read the reset ourselves.
 RATE_LIMIT_MAX_WAIT = 60   # reset ceiling: wait out any TPM breach (≤~60s); shed the daily cap
 RATE_LIMIT_RETRIES  = 1    # full-context wait-and-retry attempts on a bounded (TPM) 429
+# Models whose `retry-after` header is a safe per-minute wait (it is the time until THIS
+# request fits; reset-tokens is the time to a FULL bucket, often 2-5x longer). Measured
+# 2026-10-13 by retrying at exactly retry-after+0.5s after a real TPM 429:
+#   openai/gpt-oss-120b  6/6 succeeded (waits 8-23s instead of 44-60s) → trusted
+#   qwen/qwen3.8-27b     4/6 succeeded (2 re-429'd)                    → NOT trusted, keeps max()
+RETRY_AFTER_TRUSTED = {"openai/gpt-oss-120b"}
+# Retries for a TRUSTED model: its waits are short, so a second costs ~10-20s. Measured live
+# (2026-10-13, 5 concurrent questions): one retry at retry-after re-429'd because concurrent
+# requests drained the bucket first — a second retry keeps it on the primary instead of
+# failing over. Untrusted models keep RATE_LIMIT_RETRIES (their waits are ~45s each).
+RETRY_AFTER_RETRIES = 2
+# Split-limit models (qwen/qwen3.8-27b: ITPM 7K + OTPM 1K) also 429 at admission when the
+# ESTIMATED output won't fit the OTPM bucket, reporting reset≈1ms / no retry-after — so there
+# is no header to wait on. Back off these fixed delays (separate budget from the TPM retry
+# above, which the follow-up ITPM 429 then uses). Measured 2026-10-11: clears in ~2s.
+OTPM_BACKOFF        = (2, 4, 8)   # seconds; total ≤14s before shedding
 
 # ── Per-call token budget (Layer 2) ───────────────────────────────────────────
 # The real cap on what reaches the model is a TOKEN budget, not a chunk count

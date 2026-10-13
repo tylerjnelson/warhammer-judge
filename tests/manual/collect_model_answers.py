@@ -39,47 +39,31 @@ OUT_MD   = Path(__file__).resolve().parent / "model_eval_report.md"
 # Chat-capable text models on our Groq key. Excludes audio (whisper/orpheus),
 # the prompt-guard / gpt-oss-safeguard classifiers (not Q&A models).
 MODELS = [
-    "openai/gpt-oss-120b",     # current PROD (since 2026-07-21)
-    "qwen/qwen3.6-27b",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "openai/gpt-oss-20b",
-    "allam-2-7b",
-    # RETIRED — no longer callable:
-    #   qwen/qwen3-32b  → Groq CLOSED it on the free tier (2026-07-21). Was prod until then;
-    #                     removed from the fan-out because the API now rejects it. Historical
-    #                     scores live in model_eval_graded.md / model_eval_uncapped.md.
-    # EXCLUDED — not viable grounded-RAG backends (verified 2026-06-24):
-    #   groq/compound       → 413 Request Entity Too Large on our ~2800-tok context
-    #                         (agentic tool-definition overhead leaves no room).
-    #   groq/compound-mini  → internally routes to llama-3.3-70b-versatile (its 429
-    #                         names that model), sharing that per-model bucket, so it
-    #                         429s under load and adds nothing distinct.
+    "openai/gpt-oss-120b",     # PROD (since 2026-07-21)
+    "qwen/qwen3.8-27b",        # BACKUP (since 2026-10-12) — ITPM 7K + OTPM 1K · TPD 200K
+    # RETIRED (2026-10-12) — the roster is prod + backup only:
+    #   no longer served by Groq: qwen/qwen3-32b (closed 2026-07-21), qwen/qwen3.6-27b,
+    #     llama-3.3-70b-versatile, llama-3.1-8b-instant, meta-llama/llama-4-scout-17b-16e-instruct
+    #   dropped on purpose: openai/gpt-oss-20b, allam-2-7b (4096-tok context)
+    #   never viable: groq/compound[-mini], gpt-oss-safeguard / llama-prompt-guard (classifiers)
+    # Historical scores: model_eval_graded.md / model_eval_uncapped.md.
 ]
 MAX_OUT = config.MAX_OUTPUT_TOKENS
 
 # ── Output-cap mode (set by CLI) ──────────────────────────────────────────────
 # "fixed": uniform MAX_OUT (original behavior).
 # "omit" : send no max_completion_tokens — BUT Groq then applies a per-model DEFAULT
-#          (measured: qwen3.6-27b defaults to 2048 and truncates), so this is NOT "no limit".
+#          (measured: the retired qwen3.6-27b defaulted to 2048 and truncated), so this is NOT "no limit".
 # "tpm"  : per-model cap sized to each model's TPM so a legit answer never truncates yet the
 #          call still ADMITS (admission reserves input+cap against the model's TPM; input
 #          tops ~3400 in this set). This is the "no artificial truncation" run.
 CAP_MODE = "fixed"
 
-# Measured per-model TPM (2026-07-04): 6000 = llama3.1-8b/allam, 8000 = qwen3.6-27b/
-# gpt-oss-120b/gpt-oss-20b, 12000 = llama3.3-70b, 30000 = llama4-scout. Cap ≈ TPM − ~3400 input
-# headroom, capped at 8192; the reasoners' real worst-case needs (qwen3.6 ~2878, gpt-oss-20b
-# ~1916) sit well under these, so nothing truncates. (qwen3-32b, retired 2026-07-21, was 6000.)
+# Per-model output room (2026-10-12): both models admit ~3.4K input + 4096 out within their
+# per-minute limits; real worst-case answers sit well under it, so nothing truncates.
 PER_MODEL_CAP = {
-    "llama-3.1-8b-instant":                      2560,   # 6000 TPM (short instruct answers)
-    "allam-2-7b":                                2560,   # 6000 TPM
-    "qwen/qwen3.6-27b":                          4096,   # 8000 TPM (real max need ~2878)
-    "openai/gpt-oss-120b":                       4096,   # 8000 TPM
-    "openai/gpt-oss-20b":                        4096,   # 8000 TPM (real max need ~1916)
-    "llama-3.3-70b-versatile":                   8192,   # 12000 TPM
-    "meta-llama/llama-4-scout-17b-16e-instruct": 8192,   # 30000 TPM
+    "openai/gpt-oss-120b":                       4096,   # TPM 8000 (input + output)
+    "qwen/qwen3.8-27b":                          4096,   # ITPM 7000 + OTPM 1000
 }
 DEFAULT_ROOM_CAP = 2560   # unlisted model → assume the tightest (6000 TPM) tier
 

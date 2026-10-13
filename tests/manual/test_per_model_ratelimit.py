@@ -30,7 +30,7 @@ import config
 from openai import OpenAI, RateLimitError
 
 # Alt models on the same Groq key, each with its own per-model bucket (§5).
-ALT_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"]
+ALT_MODELS = ["qwen/qwen3.8-27b"]   # the backup (LLM_BACKUP_MODEL)
 
 PING = [{"role": "user", "content": "Reply with the single word: ok"}]
 

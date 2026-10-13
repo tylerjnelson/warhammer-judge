@@ -33,27 +33,27 @@ buildable (core-rules + CSVs), not fully data-blocked. See recon findings below.
 
 ## 2. LLM backend — resilience & the model swap
 
-Overlaps the `eval-followups` memory (the 2026-07-06 8-model re-grade). gpt-oss-120b is prod.
+Roster (2026-10-12): **gpt-oss-120b = prod, qwen/qwen3.8-27b = automatic backup**
+(`config.LLM_BACKUP_MODEL`); every other model retired. Failover, OTPM back-off and the
+per-model `retry-after` wait shipped 2026-10-13 (`serving._call_llm`).
 
-- **[P1] Watch gpt-oss-120b's 200K TPD under sustained load.** Its daily cap is 2.5× lower
-  than retired qwen3-32b's, and it's a billed reasoner — the daily budget is now the tight
-  limit. Watch-and-react (no telemetry wired). Documented config-only fallbacks if TPD 429s
-  appear: `llama-4-scout` (500K TPD, ~39/43) or `llama-3.3-70b` (100K TPD, eval-fragile).
-  → `eval-followups` memory item 2 · `spec/free-llm-providers.md` §5a/§5
-- **[P2] Cross-provider fallback pool (Tier 0 Groq rotation → Tier 1 Gemini 3 Flash →
-  Tier 2 SambaNova/OpenRouter).** Deferred hedge; the single-model robustness a pool needs
-  (no-cap serving + reset-aware 429 retry) already shipped. Build only when rotation
-  provably isn't enough.
-  → `spec/free-llm-providers.md` §6, §8
-  - **[P2] Prerequisite:** grade **Gemini 3 Flash** answers on the `eval_quality` set before
-    trusting it as a backend (still unmeasured). → `spec/free-llm-providers.md` §7
+- **[P1] Watch gpt-oss-120b's 200K TPD under sustained load.** Billed reasoner; the daily
+  budget (~65 questions/day) is the tight limit. When it runs out, requests now fail over
+  to qwen (its own ~70/day bucket). Watch `journalctl -u thejudge` for `served by backup
+  model` / `failing over` lines — frequent ones mean users are getting the 40/43 model.
+  → `spec/free-llm-providers.md` §5a/§5
+- **[P2] Adopt prompt v1 (rules 4/6 split "rule absent" vs "apply a stated rule").** A/B on
+  qwen fixed its Q20/Q31 over-refusals 3/3 with guardrails intact (Q27/Q34/Q37/Q6). Needs a
+  full 43-Q run on BOTH models before shipping — it also changes gpt-oss-120b's behaviour.
+  Lifts the backup from 40/43 toward 42/43.
+- **[P3] Reword eval Q12** to "how many VP do you score that turn": qwen reads "VP for
+  destroying" as the kill alone (5) and treats the Tactical +1 as separate — defensible.
 - **[P3] Re-evaluate system-prompt rule 10 (VP-stacking crutch).** Added for retired
   qwen3-32b; gpt-oss-120b resolves Q12 natively. A/B on Q11/Q12/Q19 present-vs-removed;
   harmless to leave. → `eval-followups` memory item 3
-- **[P3] Eval-method hygiene:** always use `collect_model_answers.py --tpm-room` (per-model
-  cap) for cross-model accuracy runs — a fixed output cap truncates reasoning models and
-  under-rates them. Keep `llama-4-scout` & `llama-3.1-8b` **out** of any quality-tier
-  rotation (rule-interaction failures). → `eval-followups` memory items 4 & 5
+- **[P3] Eval-method hygiene:** use `collect_model_answers.py --no-cap` (mirrors prod) or
+  `--tpm-room` for model runs — a fixed output cap truncates reasoning models and
+  under-rates them. → `eval-followups` memory item 4
 
 ## 3. Retrieval quality
 
