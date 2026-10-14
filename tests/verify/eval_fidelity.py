@@ -41,24 +41,44 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import scrape_rules as sr  # noqa: E402  (transforms + is_skipped_slug, kept in sync)
 from bs4 import BeautifulSoup, NavigableString, Tag  # noqa: E402
 
 log = logging.getLogger("fidelity")
 
 # Per-source cached HTML + corpus glob. Mirrors eval_completeness's constants.
-SOURCES = {
-    "core": {
-        "html":  "data/html_cache/10e/core_rules.html",
-        "glob":  "data/rule_blocks/10e/core_rules_*.md",
-        "label": "Wahapedia Core Rules",
-    },
-    "leviathan": {
-        "html":  "data/html_cache/10e/leviathan.html",
-        "glob":  "data/rule_blocks/10e/leviathan_*.md",
-        "label": "Wahapedia Leviathan",
-    },
-}
+# Templated per edition; the cache holds the page the corpus was scraped from
+# (data/html_cache/<edition>/<page key or mission-pack prefix>.html).
+def sources_for(edition: str = "10e") -> dict:
+    import config  # noqa: E402  (scripts/ is on sys.path; config sits beside it)
+    ed = config.get_edition(edition)
+    extras = ed.get("extra_core_pages", [])
+    srcs = {
+        "core": {
+            "html":    f"data/html_cache/{edition}/core_rules.html",
+            "glob":    f"data/rule_blocks/{edition}/core_rules_*.md",
+            # extra core pages share the core_rules_ prefix; audit them separately
+            "exclude": tuple(x["prefix"] + "_" for x in extras),
+            "label":   "Wahapedia Core Rules",
+        },
+    }
+    for x in extras:
+        srcs[x["key"]] = {
+            "html":  f"data/html_cache/{edition}/{x['key']}.html",
+            "glob":  f"data/rule_blocks/{edition}/{x['prefix']}_*.md",
+            "label": x["source"],
+        }
+    mp = ed["mission_pack"]
+    srcs[mp["prefix"]] = {
+        "html":  f"data/html_cache/{edition}/{mp['prefix']}.html",
+        "glob":  f"data/rule_blocks/{edition}/{mp['prefix']}_*.md",
+        "label": f"Wahapedia {mp['name']}",
+        "drop_regions": mp.get("drop_regions", []),
+    }
+    return srcs
+
+SOURCES = sources_for("10e")
 
 HEAD = {"h1", "h2", "h3"}
 ACC_MIN_WORDS = 8   # only assert accuracy on sentences distinctive enough to match
@@ -76,12 +96,16 @@ def sentences(text: str):
 
 # ── Source side (scraper-faithful) ────────────────────────────────────────────
 
-def _clean_soup(html_path: str) -> BeautifulSoup:
+def _clean_soup(html_path: str, drop_regions=()) -> BeautifulSoup:
     soup = BeautifulSoup(Path(html_path).read_text(encoding="utf-8"), "html.parser")
     sr.substitute_dice_images(soup)
     for selector in sr.REMOVE_SELECTORS:
         for el in soup.select(selector):
             el.decompose()
+    for start_id, end_id in drop_regions:      # page UI the scraper drops (not rules)
+        sr.drop_page_region(soup, start_id, end_id)
+    sr.strip_heading_numbers(soup)
+    sr.badge_numbers_into_headings(soup)
     return soup
 
 
@@ -165,9 +189,14 @@ def is_allowed(normalised: str) -> bool:
 
 # ── Corpus side ───────────────────────────────────────────────────────────────
 
-def corpus_blob(glob_pat: str) -> str:
+def _files(glob_pat, exclude=()):
+    """Corpus files for a glob, minus any whose name starts with an excluded prefix."""
+    return sorted(f for f in glob.glob(glob_pat) if not Path(f).name.startswith(tuple(exclude)))
+
+
+def corpus_blob(glob_pat: str, exclude=()) -> str:
     out = []
-    for f in glob.glob(glob_pat):
+    for f in _files(glob_pat, exclude):
         t = Path(f).read_text(encoding="utf-8")
         t = re.sub(r"^#.*$", "", t, flags=re.M)              # markdown titles
         t = re.sub(r"\*\*(Category|Source|Faction):.*$", "", t, flags=re.M)  # meta line
@@ -175,9 +204,9 @@ def corpus_blob(glob_pat: str) -> str:
     return norm(" ".join(out))
 
 
-def corpus_lines(glob_pat: str):
+def corpus_lines(glob_pat: str, exclude=()):
     """Yield (filename, prose_lines, table_rows) per corpus file, dropping chrome."""
-    for f in sorted(glob.glob(glob_pat)):
+    for f in _files(glob_pat, exclude):
         prose, rows = [], []
         for raw in Path(f).read_text(encoding="utf-8").splitlines():
             line = raw.strip()
@@ -192,14 +221,34 @@ def corpus_lines(glob_pat: str):
 
 # ── Audits ────────────────────────────────────────────────────────────────────
 
-def accuracy(src_full: str, glob_pat: str) -> dict:
+# Structure the 11e mission-deck card renderer (scrape_rules.extract_ca7_card) adds
+# around verbatim source text: list/OR/PLUS leads, a " — 2VP (UP TO 5VP)" tail,
+# disposition matchups built from icon attributes, map-only deployment entries.
+# Unwrapped before the verbatim check so the RULES text is still held to source.
+_CARD_LEAD    = re.compile(r"^- (?:OR |PLUS )?")
+_CARD_VP_TAIL = re.compile(r" — [+]?\d+VP.*$")
+_CARD_MATCHUP = re.compile(r"^.+ \(you\) vs .+ \(opponent\): Primary Mission (.+)$")
+_CARD_MAPONLY = re.compile(r"^(.+) \([a-z ]+: map image only\)$")
+_CARD_META    = re.compile(r"^\*([^·*]+?)(?: · .*)?\*$")   # "*Primary Mission · Force Dispositions: …*"
+
+
+def unwrap_rendered(line: str) -> str:
+    line = _CARD_LEAD.sub("", line)
+    for pat in (_CARD_MATCHUP, _CARD_MAPONLY, _CARD_META):
+        m = pat.match(line)
+        if m:
+            return m.group(1)
+    return _CARD_VP_TAIL.sub("", line)
+
+
+def accuracy(src_full: str, glob_pat: str, exclude=()) -> dict:
     """Every multi-word corpus sentence + table cell must be verbatim in source."""
     s_ok = s_miss = 0
     cell_ok = cell_miss = 0
     miss_sent, miss_cell = [], []
-    for fn, prose, rows in corpus_lines(glob_pat):
+    for fn, prose, rows in corpus_lines(glob_pat, exclude):
         for line in prose:
-            for s in sentences(line):
+            for s in sentences(unwrap_rendered(line)):
                 if len(s.split()) < ACC_MIN_WORDS:
                     continue
                 if norm(s) in src_full:
@@ -254,14 +303,14 @@ def fullness(sections: dict, blob: str) -> dict:
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-def audit(source: str) -> dict:
-    cfg  = SOURCES[source]
-    soup = _clean_soup(cfg["html"])
+def audit(source: str, edition: str = "10e") -> dict:
+    cfg  = sources_for(edition)[source]
+    soup = _clean_soup(cfg["html"], cfg.get("drop_regions", ()))
     src_full = source_full_text(soup)
     secs = source_sections(soup)
-    blob = corpus_blob(cfg["glob"])
+    blob = corpus_blob(cfg["glob"], cfg.get("exclude", ()))
 
-    acc = accuracy(src_full, cfg["glob"])
+    acc = accuracy(src_full, cfg["glob"], cfg.get("exclude", ()))
     full = fullness(secs, blob)
 
     s_tot = acc["sent_ok"] + acc["sent_miss"]
@@ -271,7 +320,7 @@ def audit(source: str) -> dict:
 
     log.info("")
     log.info("=" * 72)
-    log.info("FIDELITY — %s (%s)", source, cfg["label"])
+    log.info("FIDELITY — %s %s (%s)", edition, source, cfg["label"])
     log.info("=" * 72)
     log.info("[ACCURACY] corpus text must be verbatim in source")
     log.info("    sentences : %d/%d verbatim   (%d not in source)",
@@ -307,12 +356,12 @@ def audit(source: str) -> dict:
     }
 
 
-def run(sources, strict: bool = False) -> int:
+def run(sources, strict: bool = False, edition: str = "10e") -> int:
     if not logging.getLogger().handlers and not log.handlers:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
     rc = 0
     for source in sources:
-        res = audit(source)
+        res = audit(source, edition)
         if strict and not res["ok"]:
             rc = 1
     return rc
@@ -320,9 +369,12 @@ def run(sources, strict: bool = False) -> int:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Text-fidelity audit (accuracy + fullness).")
-    ap.add_argument("--source", choices=list(SOURCES) + ["all"], default="all")
+    ap.add_argument("--source", default="all",
+                    help="a source key of the edition (10e: core, leviathan; "
+                         "11e: core, rules_appendix, chapter_approved) or 'all'")
     ap.add_argument("--strict", action="store_true",
                     help="exit nonzero on any accuracy miss or REVIEW gap")
+    ap.add_argument("--edition", default="10e")
     args = ap.parse_args()
-    srcs = list(SOURCES) if args.source == "all" else [args.source]
-    sys.exit(run(srcs, strict=args.strict))
+    srcs = list(sources_for(args.edition)) if args.source == "all" else [args.source]
+    sys.exit(run(srcs, strict=args.strict, edition=args.edition))

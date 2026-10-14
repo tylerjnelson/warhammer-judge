@@ -395,16 +395,31 @@ EDITIONS = {
         "label":            "11th Edition",
         "active":           False,         # flip True on release (Stage 2 §2.4)
         "default":          False,         # flip True to make 11th the default (Stage 2 §2.5)
-        "wahapedia_base":   "https://wahapedia.ru/wh40k11ed",   # VERIFY exact slug on release
-        "core_rules_url":   "<FILL: wh40k11ed core-rules URL>",
+        "wahapedia_base":   "https://wahapedia.ru/wh40k11ed",   # verified live 2026-07-30
+        "core_rules_url":   "https://wahapedia.ru/wh40k11ed/the-rules/core-rules/",
+        # Scraped alongside the core rules as Core_Rules (definitions, clarifications,
+        # errata the core page links to). Prefix must extend "core_rules_".
+        "extra_core_pages": [
+            {"key":    "rules_appendix",
+             "url":    "https://wahapedia.ru/wh40k11ed/the-rules/rules-appendix/",
+             "prefix": "core_rules_appendix",
+             "source": "Wahapedia_Rules_Appendix"},
+        ],
         "mission_pack": {
-            "name":         "<FILL: 11e mission pack name>",
-            "category":     "<FILL: e.g. MissionPack11e>",          # ChromaDB category label
-            "prefix":       "<FILL: slug, e.g. mission_pack_11e>",  # rule-block filename prefix
-            "url":          "<FILL: wh40k11ed mission pack URL>",
-            "source":       "<FILL: e.g. Wahapedia_<Pack>>",
-            "toggle_label": "<FILL: e.g. '<Pack> Matched Play'>",
+            # 11e matched play = the Chapter Approved Mission Deck 2026-27 (battle
+            # sequence, Force Disposition matchups -> Primary Mission, Secondary/Twist/
+            # Deployment decks). Wahapedia's wh40k11ed/.../leviathan/ page is the 10e
+            # pack re-hosted (text identical to 10e, absent from the 11e menu) — not used.
+            "name":         "Chapter Approved",
+            "category":     "Chapter_Approved",
+            "prefix":       "chapter_approved",
+            "url":          "https://wahapedia.ru/wh40k11ed/the-rules/mission-deck-2026-27/",
+            "source":       "Wahapedia_Mission_Deck_2026-27",
+            "toggle_label": "Chapter Approved Matched Play",
             "priority":     2,
+            # The on-page Mission Generator (tool instructions, buttons, JS card
+            # templates) is UI, not rules; every card is also in "Card Decks".
+            "drop_regions": [("Mission-Generator", "Card-Decks")],
         },
         "csv_dir":          "data/raw_csv/11e",
         "csv_archive_dir":  "data/raw_csv_archive/11e",

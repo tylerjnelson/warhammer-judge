@@ -300,6 +300,8 @@ _CORE_PHRASE_TRIGGERS = [
     "all armies", "always active", "mission rule",
     "secondary mission", "primary mission", "tournament",
     "matched play", "victory points", "embark", "disembark", "riding in",
+    # 11e Chapter Approved mission-deck vocabulary (absent from 10e questions)
+    "force disposition", "twist card", "mission deck", "deployment card",
 ]
 # D16: short/ambiguous tokens that, as bare substrings, re-scope retrieval on a
 # COINCIDENTAL match ("vp" inside another token; "transport"/"inside"/"scoring"

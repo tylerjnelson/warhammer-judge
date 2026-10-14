@@ -9,23 +9,32 @@ Legend: **P1** = has real product/operational impact · **P2** = quality/robustn
 
 ---
 
-## 1. Dual-edition — 11th Edition launch (data-gated)
+## 1. Dual-edition — 11th Edition launch
 
-The single largest deferred block. All Stage-1 plumbing is built and live. **2026-07-30
-recon: `wh40k11ed` is LIVE and serving real, evolving 11th data** — so this is now
-buildable (core-rules + CSVs), not fully data-blocked. See recon findings below.
+All Stage-1 plumbing is built and live. **2026-10-14: 11e corpus BUILT** (collection
+`warhammer_rules_11e`), still `active=False` — not yet user-visible.
 
-- **[P1] Ship 11th Edition (Stage 2).** Fill the `11e` `<FILL>` config values (URLs,
-  mission-pack identity), validate the two transformation spots against real data, build
-  the collection, flip `active` then later `default`.
-  → `spec/dual-edition.md` §11 (the executable launch runbook), §12 (known risks)
-  - **2026-10-10 RE-RECON (plan changed — supersedes the 2026-07-30 notes below):**
-    - ✅ `wh40k11ed` `Last_update` now **2026-10-10** (actively maintained; newer than frozen 10e). Whole dataset now genuinely 11th: Stratagems/Enhancements/Detachments/Detachment_abilities ALL now differ from 10e (were identical in July).
-    - ✅ Roster curated: **1,501 units (11e) vs 1,712 (10e)** — 167 dropped, 21 added. Built corpus-reconciliation orphan-sweep handles removals on `--reset`.
-    - 🔴 **NEW required ETL fix — quantity-tiered points.** Headers still byte-identical (EXPECTED_COLUMNS safe), BUT `Datasheets_models_cost.csv` now encodes 11e tiered pricing as label rows (`desc="YOUR 1ST TO 2ND UNITS COST", cost=""` → `1 model|115` → `YOUR 3RD+ UNIT COSTS` → `1 model|130`). **2,369 label rows in 11e vs 0 in 10e; 423 multi-tier units.** `etl.py` points loop (`build_unit_block` ~L250-259, `if desc and cost / elif cost`) SILENTLY DROPS desc-with-empty-cost rows → multi-tier units render as contradictory bare `1 model: X/Y pts` with tier context lost. **Fix block builder before 11e ingest.** (Was previously assessed "no ETL change needed" — that is now wrong.)
-    - 🟢 **Leviathan mission pack NOW LIVE for 11th — DECIDED 2026-10-10: INCLUDE it (reverses July core-rules-only deferral).** `wh40k11ed/the-rules/leviathan/` is distinct from 10e, 11th-tagged, full content: 132 `cgCard`+49 `cgCardLCA` (existing scraper classes), 48 Primary/228 Secondary mission mentions, 14-step sequence, NEW `Gambit Deck` card type (151×). Fill 11e `mission_pack.*` with Leviathan (name=Leviathan, url=.../the-rules/leviathan/), scrape `--mission-pack`, **validate the new Gambit-deck cards + frameDark on scrape.** (Contradicts spec §1 "Leviathan does not carry over.") `matched-play` slug still a 10e mirror — ignore.
-    - ⚠️ HTML scraper core-rules work (§11.3) unchanged; page grew 637KB→773KB.
-  - **2026-07-30 original recon (HISTORICAL — see re-recon above):** slug confirmed live; CSV data real 11th w/ unchanged schema; wargear/abilities/detachment divergence; concluded no ETL change (now superseded) and deferred mission decks as not-yet-published (now superseded).
+- **[P1] Finish 11e launch: evaluate, then activate.** Done 2026-10-14:
+  - Sources: core rules + **Rules Appendix** (`extra_core_pages`) + **Mission Deck 2026-27**
+    as the mission pack ("Chapter Approved"; Mission Generator UI region dropped). 11e
+    `leviathan/` is the 10e pack re-hosted — NOT used (corrects the 2026-10-10 re-recon).
+  - Scraper 11e markup (gated `v11_markup`, 10e byte-stable): section-number badges,
+    dice sprites (`cruD{N}` — had silently dropped dice values), per-ability core-ability
+    sections, boxed steps w/ tables in document order, `cgCardCA7` cards w/ WHEN/VP,
+    step badges → headings, 40-char floor for one-sentence glossary rules.
+  - ETL: tiered points (labels, Agents-of-the-Imperium context headers, numeric line
+    sort, repeated tables de-duped), CSV records split by raw line breaks, new 11e
+    fields (Support Unit, Upgrade, support_leader, Detachment DP + Force Disposition).
+  - Ingest: FAQ pages chunked per Q&A.
+  - 10e: the CSV split-record fix repaired the empty Eradication Cohort stratagem
+    (`stratagem_000010748005`) and swept the junk `stratagem_Shooting phase.md`
+    (re-ingested 2026-10-14; audit unchanged: 93/98 core, 67/84 Leviathan, fidelity clean).
+  - `eval_fidelity.py --edition 11e`: 100% accuracy on all three sources, 98%+ coverage.
+  **Remaining:** (a) build an 11e eval set (retrieval cases + a graded question set —
+  the 43-Q set is 10e-specific); (b) flip `EDITIONS["11e"]["active"] = True`; later the
+  default. → `spec/dual-edition.md` §11.4–11.7
+- **[P3] 11e Deployment cards are map images only** (6 cards) — zone geometry isn't in
+  text; the Deployment Card Key defines zones/objectives. Nothing to scrape today.
 - **[P2] 11e maintenance dependency:** if 11e introduces a *new faction-bearing category*
   that 10e lacks, add it to `FACTION_SCOPED_CATEGORIES` or the P2 cross-faction leak
   re-opens for that category.
@@ -42,10 +51,10 @@ per-model `retry-after` wait shipped 2026-10-13 (`serving._call_llm`).
   to qwen (its own ~70/day bucket). Watch `journalctl -u thejudge` for `served by backup
   model` / `failing over` lines — frequent ones mean users are getting the 40/43 model.
   → `spec/free-llm-providers.md` §5a/§5
-- **[P2] Adopt prompt v1 (rules 4/6 split "rule absent" vs "apply a stated rule").** A/B on
+- **[P2] [DEFERRED 2026-10-13 — Groq budget] Adopt prompt v1 (rules 4/6 split "rule absent" vs "apply a stated rule").** A/B on
   qwen fixed its Q20/Q31 over-refusals 3/3 with guardrails intact (Q27/Q34/Q37/Q6). Needs a
   full 43-Q run on BOTH models before shipping — it also changes gpt-oss-120b's behaviour.
-  Lifts the backup from 40/43 toward 42/43.
+  Lifts the backup from 40/43 toward 42/43. Costs ~150K TPD per model (most of a day's budget).
 - **[P3] Reword eval Q12** to "how many VP do you score that turn": qwen reads "VP for
   destroying" as the kill alone (5) and treats the Tactical +1 as separate — defensible.
 - **[P3] Re-evaluate system-prompt rule 10 (VP-stacking crutch).** Added for retired

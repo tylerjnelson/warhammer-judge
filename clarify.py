@@ -144,7 +144,8 @@ def build_unit_index(edition: str):
     # pack name itself is subtracted.
     mp_name  = config.get_edition(edition)["mission_pack"]["name"].lower()
     mp_vocab = set(re.findall(r"[a-z0-9]+", mp_name))
-    mp_glob  = str((ROOT / "data" / "rule_blocks" / edition / f"{mp_name}_*.md"))
+    mp_prefix = config.get_edition(edition)["mission_pack"]["prefix"]
+    mp_glob  = str((ROOT / "data" / "rule_blocks" / edition / f"{mp_prefix}_*.md"))
     for path in glob.glob(mp_glob):
         with open(path, encoding="utf-8") as f:
             mp_vocab |= set(re.findall(r"[a-z0-9]+", f.read().lower()))

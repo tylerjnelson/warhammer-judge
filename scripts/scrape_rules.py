@@ -33,7 +33,7 @@ import argparse
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Comment
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -50,22 +50,48 @@ def build_pages(edition_code: str) -> dict:
     """Build the per-edition scrape targets (core rules + mission pack) from config."""
     ed = config.get_edition(edition_code)
     mp = ed["mission_pack"]
-    return {
+    # 11e markup handling in extract_columns2_block (per-ability sections, boxed
+    # steps with tables, prose/table document order). Off for 10e: it shares the
+    # markup, but its frozen, eval-tuned corpus must not re-chunk under the watcher.
+    v11_markup = edition_code != "10e"
+    # 11e's glossary-style appendix defines terms in one short sentence ("The term
+    # 'Reserves' is the same as strategic reserves.", "A unit cannot make more than
+    # one Normal Move in a phase.") — below the 70/80-char decorative-fragment floors.
+    v11_floor  = {"min_section_chars": 40} if v11_markup else {}
+    pages = {
         "core_rules": {
             "url":      ed["core_rules_url"],
             "prefix":   "core_rules",
             "category": "Core_Rules",
             "source":   "Wahapedia_Core_Rules",
             "priority": 1,
-        },
-        "mission_pack": {
-            "url":      mp["url"],
-            "prefix":   mp["prefix"],
-            "category": mp["category"],
-            "source":   mp["source"],
-            "priority": mp["priority"],   # mission-pack rules override core rules
+            "v11_markup": v11_markup,
+            **v11_floor,
         },
     }
+    # Further pages scraped AS core rules (11e Rules Appendix). Their prefix extends
+    # "core_rules_" so ingest/retrieval treat them as Core_Rules with no extra code.
+    for extra in ed.get("extra_core_pages", []):
+        pages[extra["key"]] = {
+            "url":      extra["url"],
+            "prefix":   extra["prefix"],
+            "category": "Core_Rules",
+            "source":   extra["source"],
+            "priority": 1,
+            "v11_markup": v11_markup,
+            **v11_floor,
+        }
+    pages["mission_pack"] = {
+        "url":      mp["url"],
+        "prefix":   mp["prefix"],
+        "category": mp["category"],
+        "source":   mp["source"],
+        "priority": mp["priority"],   # mission-pack rules override core rules
+        "v11_markup": v11_markup,
+        "drop_regions": mp.get("drop_regions", []),
+        **v11_floor,
+    }
+    return pages
 
 # ── Nav/chrome selectors to remove before parsing ─────────────────────────────
 
@@ -80,6 +106,11 @@ REMOVE_SELECTORS = [
                                                 # "X keyword is used in the following
                                                 # datasheets" faction reference noise
     ".NavColumns3",                             # the page table-of-contents blob
+    "[class^='h_number']",                      # 11e section-number badges (h_number,
+                                                # h_number_red/_red2): "Coherency 03.03",
+                                                # "DEEP STRIKE 24.09", "Actions 16" — they
+                                                # pollute titles/slugs and break ingest's
+                                                # ALL-CAPS sub-rule lead (RULE_LEAD)
 ]
 
 # ── Text cleaning ─────────────────────────────────────────────────────────────
@@ -120,6 +151,7 @@ def slugify(text):
 # ── Dice-image → text ─────────────────────────────────────────────────────────
 
 DICE_IMG = re.compile(r"^d([1-6])\.png$", re.I)
+DICE_SPRITE = re.compile(r"cruD([1-6])")
 
 def substitute_dice_images(soup):
     """Replace Wahapedia dice-result images (d1.png … d6.png) with their digit.
@@ -130,7 +162,9 @@ def substitute_dice_images(soup):
     image for a NavigableString of its digit BEFORE REMOVE_SELECTORS strips all
     <img> tags. Without this, a "2+/3+/…" column collapses to a bare "+".
     Deterministic and exact — no LLM/vision (the pipeline model is text-only).
-    Returns the number of images substituted.
+    11e draws the same faces as empty CSS sprites (<div class="cruD1">) instead
+    of images — "Unmodified <cruD1>" must read "Unmodified 1" — so those are
+    swapped the same way. Returns the number of dice substituted.
     """
     n = 0
     for img in soup.find_all("img"):
@@ -139,6 +173,10 @@ def substitute_dice_images(soup):
         if m:
             img.replace_with(NavigableString(m.group(1)))
             n += 1
+    for div in soup.find_all(class_=DICE_SPRITE):
+        m = next(DICE_SPRITE.fullmatch(c) for c in div["class"] if DICE_SPRITE.fullmatch(c))
+        div.replace_with(NavigableString(f" {m.group(1)} "))
+        n += 1
     return n
 
 # ── Wahapedia custom div extraction ──────────────────────────────────────────
@@ -149,6 +187,60 @@ WAHAPEDIA_CARD_CLASSES = (
     "stratText", "stratLegend",
 )
 
+def drop_page_region(soup, start_id, end_id):
+    """Remove everything from the heading with id=start_id up to (not including) the
+    heading with id=end_id. Used for page regions that are interactive UI rather than
+    rules (11e Mission Deck's "Mission Generator": instructions for the on-page tool,
+    its buttons and JS card templates) — the cards themselves follow in "Card Decks".
+    Returns the number of nodes removed (0 if either anchor is missing)."""
+    start, end = soup.find(id=start_id), soup.find(id=end_id)
+    if start is None or end is None:
+        return 0
+    region = [start]
+    for el in start.next_elements:
+        if el is end:
+            break
+        region.append(el)
+    keep    = {id(a) for a in end.parents}          # containers that also hold `end`
+    doomed  = {id(e) for e in region} - keep
+    removed = 0
+    for el in region:
+        if id(el) in keep or (el.parent is not None and id(el.parent) in doomed):
+            continue                                 # kept, or leaves with its parent
+        el.extract()
+        removed += 1
+    return removed
+
+
+def badge_numbers_into_headings(soup):
+    """11e mission sequence: each step's number is a caBadge3 div placed just before
+    its heading, i.e. trailing the PREVIOUS step's prose — left in place it reads as
+    a stray "11" at the end of step 10. Move it into the heading it belongs to
+    ("11. Determine First Turn", like the core rules' "1. Hit Roll"), then drop the
+    badge. 10e pages carry no caBadge3, so this is a no-op there."""
+    for badge in soup.find_all(class_="caBadge3"):
+        num  = clean_text(badge.get_text(" "))
+        head = badge.find_next(["h2", "h3"])
+        if num.isdigit() and head is not None:
+            first = next(head.strings, None)
+            if first is not None:
+                first.replace_with(f"{num}. {first.lstrip()}")
+        badge.decompose()
+
+
+SECTION_NUMBER_LEAD = re.compile(r"^\s*\d+(?:\.\d+)+\s+")
+
+def strip_heading_numbers(soup):
+    """Drop a leading dotted section number typed into a heading's text (11e's
+    "24.28.01 Precision and Devastating Wounds"). The badge-style numbers are
+    span/div elements removed via REMOVE_SELECTORS; these are plain text. Step
+    numbers ("1. Start of Charge Phase") have no digit after the dot and are kept."""
+    for h in soup.find_all(["h2", "h3", "h4"]):
+        first = next(h.strings, None)
+        if first and SECTION_NUMBER_LEAD.match(first):
+            first.replace_with(SECTION_NUMBER_LEAD.sub("", first, count=1))
+
+
 def is_wahapedia_card(element):
     if not hasattr(element, "get"):
         return False
@@ -158,11 +250,135 @@ def is_wahapedia_card(element):
         for cls in classes
     )
 
+def _fd_name(code):
+    """Force-disposition CSS code -> rules name ("TakeAndHold" -> "Take and Hold")."""
+    words = re.findall(r"[A-Z][a-z]*", code or "")
+    return " ".join(w if i == 0 or w not in ("And", "The", "Of") else w.lower()
+                    for i, w in enumerate(words))
+
+
+def _ca7_score_line(score):
+    """One scoring row: optional OR/PLUS joiner, the condition, then its VP column(s)
+    (a Fixed/Tactical pair renders as "4VP FIXED; 5VP TACTICAL (UP TO 5VP)")."""
+    lead, cond, vps = "", [], []
+    for ch in score.children:
+        if isinstance(ch, NavigableString):
+            cond.append(str(ch))
+            continue
+        cls = set(ch.get("class", []))
+        if "caPmOr" in cls:
+            lead = "OR "
+        elif "caPmPlus" in cls:
+            lead = "PLUS "
+        elif cls & {"caPmVP", "caPmVPCol", "caPmVPPair"}:
+            cols = ch.find_all(class_="caPmVPCol") if "caPmVPPair" in cls else [ch]
+            for col in cols:
+                parts = [col] if "caPmVP" in col.get("class", []) else \
+                        col.find_all(class_=["caPmVP", "caPmCumul"])
+                vps.append(" ".join(clean_text(x.get_text(" ")) for x in parts))
+        else:
+            cond.append(ch.get_text(separator=" "))
+    line = f"- {lead}{clean_text(' '.join(cond))}"
+    return f"{line} — {'; '.join(vps)}" if vps else line
+
+
+def _ca7_body_lines(body):
+    lines = []
+    for el in body.children:
+        if isinstance(el, NavigableString):
+            lines.append(clean_text(str(el)))
+            continue
+        cls = set(el.get("class", []))
+        if "caPmBlock" in cls:                       # "ANY BATTLE ROUND" scoring block
+            for ch in el.children:
+                if isinstance(ch, NavigableString):
+                    lines.append(clean_text(str(ch)))
+                    continue
+                c = set(ch.get("class", []))
+                if "caPmHdr" in c:
+                    lines.append(f"{clean_text(ch.get_text(' '))}:")
+                elif "caPmScore" in c:
+                    lines.append(_ca7_score_line(ch))
+                elif ch.name == "table" or ch.find("table"):
+                    lines.extend(prose_and_tables_in_order(ch))
+                else:                                 # caPmWhen / caPmNote / prose
+                    lines.append(clean_text(ch.get_text(separator=" ")))
+        elif "caFdChart" in cls:                     # disposition matchup -> primary mission
+            for row in el.find_all(class_="caFdRow"):
+                fds = [i["title"].split(":", 1)[-1].strip()
+                       for i in row.find_all(attrs={"title": True})]
+                mission = row.find(class_="caFdMissionName")
+                if len(fds) == 2 and mission:
+                    lines.append(f"- {fds[0]} (you) vs {fds[1]} (opponent): Primary Mission "
+                                 f"{clean_text(mission.get_text(' '))}")
+        elif "caAct" in cls:                         # embedded action
+            hdr  = el.find(class_="caActHdr")
+            kind = el.find(class_="caActType")
+            lines.append(f"{clean_text(hdr.get_text(' ')) if hdr else 'Action'}"
+                         f"{' (' + clean_text(kind.get_text(' ')) + ')' if kind else ''}:")
+            for row in el.find_all(class_="caActRow"):
+                lines.append(f"- {clean_text(row.get_text(separator=' '))}")
+        elif el.name == "table" or el.find("table"):
+            lines.extend(prose_and_tables_in_order(el))
+        else:                                         # caPmIntro / caPmNote / prose
+            lines.append(clean_text(el.get_text(separator=" ")))
+    return [l for l in lines if l]
+
+
+def extract_ca7_card(card):
+    """11e mission-deck card (cgCardCA7): name, type, force-disposition matchup,
+    fluff, then the scoring blocks with their WHEN / condition / VP structure.
+
+    The generic card path flattens these to one run and drops the VP values
+    (they sit in caPmVP spans, not the cgText divs it reads). Output keeps a
+    standalone **NAME** line per card so ingest's split_card_deck chunks per card.
+    """
+    def txt(el):
+        return clean_text(el.get_text(separator=" ")) if el else ""
+
+    name = txt(card.find(class_="ca7Name"))
+    typ  = card.find(class_="ca7Type")
+    if typ is not None and typ.find(class_="ca7TypeSolo"):
+        typ = typ.find(class_="ca7TypeSolo")          # drop the Attacker/Defender variants
+    kind = txt(typ)
+    body = card.find(class_="ca7Body")
+    if body is None:
+        # Map-only card (Deployment deck): the map is an image. A list entry, not a
+        # bold title, so ingest doesn't make a near-empty per-card chunk.
+        return f"- {name} ({kind.lower() or 'card'}: map image only)" if name else ""
+
+    meta = kind
+    if card.find(class_="ca7Fixed"):
+        meta += " · Fixed Mission"
+    fd = card.find(class_="ca7Fd")
+    if fd:
+        you = fd.find(class_="ca7FdPlayer")
+        opp = fd.find(class_="ca7FdOpp")
+        you = you.find(attrs={"data-fd": True}) if you else None
+        opp = opp.find(attrs={"data-fd": True}) if opp else None
+        if you and opp:
+            meta += (f" · Force Dispositions: {_fd_name(you['data-fd'])} (you) vs "
+                     f"{_fd_name(opp['data-fd'])} (opponent)")
+    lines = [f"**{name}**"]
+    if meta:
+        lines.append(f"*{meta}*")
+    legend = txt(card.find(class_="ca7Legend"))
+    if legend:
+        lines.append(f"> {legend}")
+    lines.extend(_ca7_body_lines(body))
+    return "\n".join(lines)
+
+
 def extract_card_text(element):
     """
     Extract text from a Wahapedia custom card div, preserving structure.
-    Handles cgCardLCA (mission cards), abWrap (ability boxes).
+    Handles cgCardLCA (mission cards), abWrap (ability boxes), and 11e's
+    cgCardCA7 mission-deck cards (delegated to extract_ca7_card).
     """
+    ca7 = element if "cgCardCA7" in element.get("class", []) else element.find(class_="cgCardCA7")
+    if ca7 is not None:
+        return extract_ca7_card(ca7)
+
     lines = []
 
     header = element.find(class_=re.compile(r"cgHeader|abName|stratName"))
@@ -292,6 +508,44 @@ def table_to_lines(element):
     return lines
 
 
+def prose_and_tables_in_order(element):
+    """Lines for a wrapper holding both prose and tables, in DOCUMENT order.
+
+    The legacy table branch emits all the prose and then every table, which reorders
+    a step whose condition table sits mid-list (11e Inflict Damage: "…matching the
+    first condition below:" -> Resolve Damage -> [conditions]). Here prose is
+    buffered and flushed at each outermost table and list item, so the table rows
+    land where the source puts them.
+    """
+    lines, buf = [], []
+
+    def flush_buf():
+        text = clean_text(" ".join(buf))
+        if text:
+            lines.append(text)
+        buf.clear()
+
+    def walk(el):
+        for ch in el.children:
+            if isinstance(ch, Comment):
+                continue
+            if isinstance(ch, NavigableString):
+                buf.append(str(ch))
+            elif ch.name == "table":
+                flush_buf()
+                lines.extend(table_to_lines(ch))
+            elif ch.name == "li":
+                flush_buf()
+                walk(ch)
+                flush_buf()
+            else:
+                walk(ch)
+
+    walk(element)
+    flush_buf()
+    return lines
+
+
 def extract_columns2_block(col2, page_config, seed_heading):
     """Parse ONE <div class="Columns2"> into per-rule sections.
 
@@ -321,7 +575,7 @@ def extract_columns2_block(col2, page_config, seed_heading):
         # keeps genuinely short self-titled steps — e.g. "Determine First Turn"
         # ("Each mission will tell you how to determine which player has the first
         # turn." is 76 chars), which would otherwise vanish from the sequence.
-        if len(clean_text(" ".join(body))) < 70:
+        if len(clean_text(" ".join(body))) < page_config.get("min_section_chars", 70):
             return
         content = (
             f"# {heading}\n"
@@ -387,6 +641,19 @@ def extract_columns2_block(col2, page_config, seed_heading):
         # prose first so it isn't dropped, then the table rows.
         if name == "table" or node.find("table"):
             flush_prose()
+            if page_config.get("v11_markup") and name != "table":
+                # A boxed step led by its own heading ("1. Hit Roll", "3. Save
+                # Rolls") is a section of its own — this branch runs before the
+                # self-titled-box check below, so handle the title here.
+                title_el = node.find(["h2", "h3"])
+                title    = clean_text(title_el.get_text(" ")) if title_el else ""
+                if title and clean_text(node.get_text(separator=" ")).startswith(title):
+                    flush(current_heading, current_lines)
+                    current_heading = title
+                    current_lines   = []
+                    title_el.decompose()
+                current_lines.extend(prose_and_tables_in_order(node))
+                continue
             if name != "table":
                 prose = clean_text(" ".join(
                     str(s) for s in node.find_all(string=True)
@@ -409,6 +676,24 @@ def extract_columns2_block(col2, page_config, seed_heading):
             if text:
                 current_lines.append(text)
             continue
+
+        # Named ability box (11e core abilities): an abWrap titled by an .abName div
+        # rather than an h2/h3 — sometimes wrapped in a BreakInsideAvoid that also
+        # carries its "SEE ALSO" note. The ability list spans several Columns2 blocks
+        # whose seed headings are whatever came before ("Duplicated Abilities", a
+        # stray h3), so emit each box as its OWN section and leave the running
+        # heading alone — loose prose after the box still belongs to that heading.
+        # Gated per edition (page_config): 10e uses the same markup, but its corpus is
+        # frozen and eval-tuned, so its chunking must stay byte-stable.
+        if page_config.get("v11_markup") and hasattr(node, "find_all"):
+            names = node.find_all(class_="abName")
+            if len(names) == 1:
+                title = clean_text(names[0].get_text(" "))
+                if title:
+                    flush_prose()
+                    # "[DEVASTATING WOUNDS]" -> "Devastating Wounds" (10e's file titles)
+                    flush(title.strip("[] ").title(), [clean_text(node.get_text(separator=" "))])
+                    continue
 
         # Self-titled box: a frame/BreakInsideAvoid box whose first element is its
         # own h2/h3 (e.g. the Devastating Wounds / Sustained Hits / Mortal Wounds
@@ -530,7 +815,7 @@ def extract_loose_heading_sections(soup, page_config):
         if is_skipped_slug(slug):
             return
         text = clean_text(" ".join(lines))
-        if len(text) < 80:
+        if len(text) < page_config.get("min_section_chars", 80):
             return
         content = (
             f"# {heading}\n"
@@ -630,7 +915,7 @@ def split_into_sections(soup, page_config):
         if is_skipped_slug(slug):
             return
         full_text = " ".join(lines)
-        if len(full_text) < 80:
+        if len(full_text) < page_config.get("min_section_chars", 80):
             return
         content = (
             f"# {heading}\n"
@@ -856,6 +1141,10 @@ def scrape_page(key, page_config, manifest, blocks_dir, force=False):
     for selector in REMOVE_SELECTORS:
         for el in soup.select(selector):
             el.decompose()
+    for start_id, end_id in page_config.get("drop_regions", []):
+        drop_page_region(soup, start_id, end_id)
+    strip_heading_numbers(soup)
+    badge_numbers_into_headings(soup)
 
     sections = split_into_sections(soup, page_config)
 
@@ -872,13 +1161,14 @@ def scrape_page(key, page_config, manifest, blocks_dir, force=False):
 
     return written, skipped, emitted
 
-def run(pages=("core_rules", "mission_pack"), force=False, edition="10e"):
+def run(pages=None, force=False, edition="10e"):
     ed            = config.get_edition(edition)
     blocks_dir    = ROOT / ed["blocks_dir"]
     manifest_path = ROOT / ed["scrape_manifest"]
     blocks_dir.mkdir(parents=True, exist_ok=True)
 
     all_pages      = build_pages(edition)
+    pages          = tuple(all_pages) if pages is None else pages
     manifest       = load_manifest(manifest_path)
     total_written  = 0
     total_skipped  = 0
@@ -901,8 +1191,12 @@ def run(pages=("core_rules", "mission_pack"), force=False, edition="10e"):
         # carries leaves a stale {prefix}_{slug}.md behind.
         removed = 0
         prefix = page_config["prefix"]
+        # Another page's longer prefix nested under this one ("core_rules_appendix_"
+        # inside "core_rules_*") is that page's to sweep, never this one's.
+        nested = tuple(p["prefix"] + "_" for k, p in all_pages.items()
+                       if k != key and p["prefix"].startswith(prefix + "_"))
         for f in blocks_dir.glob(f"{prefix}_*.md"):
-            if f.name not in emitted:
+            if f.name not in emitted and not f.name.startswith(nested):
                 f.unlink()
                 manifest.pop(f.name, None)
                 removed += 1
@@ -922,7 +1216,8 @@ def run(pages=("core_rules", "mission_pack"), force=False, edition="10e"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrape Wahapedia rules pages")
-    parser.add_argument("--core",         action="store_true", help="Scrape core rules only")
+    parser.add_argument("--core",         action="store_true",
+                        help="Scrape core rules (and extra core pages) only")
     parser.add_argument("--mission-pack", action="store_true",
                         help="Scrape the edition's mission pack only")
     # Hidden 10th-era alias for muscle memory; maps to the mission_pack target.
@@ -931,12 +1226,12 @@ if __name__ == "__main__":
     parser.add_argument("--edition",      default="10e", help="Edition code (default: 10e)")
     args = parser.parse_args()
 
-    if args.core:
-        pages = ("core_rules",)
+    if args.core:      # core rules + any extra core pages (11e Rules Appendix)
+        pages = tuple(k for k in build_pages(args.edition) if k != "mission_pack")
     elif args.mission_pack or args.leviathan:
         pages = ("mission_pack",)
     else:
-        pages = ("core_rules", "mission_pack")
+        pages = None       # every page the edition defines
 
     _, _, failed = run(pages=pages, force=args.force, edition=args.edition)
     # Exit 2 = partial/total fetch failure (distinct from 1 = crash), so callers

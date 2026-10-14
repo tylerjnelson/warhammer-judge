@@ -23,6 +23,7 @@ import re
 import json
 import hashlib
 import argparse
+import io
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +41,30 @@ import config
 # ── CSV loading ───────────────────────────────────────────────────────────────
 
 READ_OPTS = dict(sep="|", encoding="utf-8-sig", dtype=str)
+
+def read_wahapedia_csv(path):
+    """Read one Wahapedia export, re-joining records split by raw line breaks.
+
+    The exports are unquoted, and some text fields carry literal line breaks
+    (11e: Deathwatch "FUROR/MALLEUS/PURGATUS TACTICS", several stratagems and
+    army rules; 10e: two stratagem lines). pandas would read each fragment as its
+    own row, shifting rules text into the id/faction columns. Every record ends
+    with the same number of '|' as the header, so physical lines are joined
+    until a record is complete.
+    """
+    lines = path.read_text(encoding="utf-8-sig").split("\n")
+    width = lines[0].count("|")
+    records, buf = [lines[0]], ""
+    for line in lines[1:]:
+        line = line.rstrip("\r")
+        buf  = f"{buf} {line}" if buf else line
+        if buf.count("|") >= width:
+            records.append(buf)
+            buf = ""
+    if buf.strip():
+        records.append(buf)
+    opts = {k: v for k, v in READ_OPTS.items() if k != "encoding"}
+    return pd.read_csv(io.StringIO("\n".join(records)), **opts)
 
 def load_csvs(csv_dir):
     """Load all Wahapedia CSVs into a dict of DataFrames. Silent on success."""
@@ -67,7 +92,7 @@ def load_csvs(csv_dir):
             print(f"[WARN] Missing CSV: {filename} — skipping", file=sys.stderr)
             dfs[key] = pd.DataFrame()
             continue
-        df = pd.read_csv(path, **READ_OPTS)
+        df = read_wahapedia_csv(path)
         # Strip empty trailing column Wahapedia sometimes appends
         df = df.loc[:, ~df.columns.str.fullmatch(r"\s*")]
         # Strip whitespace from all string values
@@ -173,6 +198,59 @@ def source_info(source_id, source_df):
     is_errata   = errata_date not in ("", "—")
     return (date_str, is_errata)
 
+# ── Points helper ─────────────────────────────────────────────────────────────
+
+def points_lines(unit_costs):
+    """Render a datasheet's Datasheets_models_cost rows as markdown lines.
+
+    10e rows are all (description, cost) pairs. 11e adds quantity-tiered pricing:
+    a row with a description and NO cost is a tier label ("YOUR 1ST TO 2ND UNITS
+    COST", "YOUR 3RD+ UNIT COSTS", "WARGEAR OPTIONS") heading the priced rows under
+    it. Dropping those labels turns a two-tier unit into contradictory bare
+    "1 model: 65 / 1 model: 75" lines, so each tier is rendered under its label.
+    Some 11e units also carry context headers (Agents of the Imperium:
+    "AGENTS OF THE IMPERIUM Detachment" vs "Assigned Agent" pricing) that scope
+    every tier below them, so each such tier is prefixed with its context. The 11e export also repeats some tables (every row doubled,
+    then the table again), so consecutive duplicate rows and repeated identical
+    tiers are dropped.
+    A 10e unit (no labels, no repeats) renders exactly as before.
+    """
+    tiers, label, items, prev, context = [], None, [], None, None
+    for _, c in unit_costs.iterrows():
+        desc = strip_html(safe(c["description"], ""))
+        cost = safe(c["cost"], "")
+        if (desc, cost) == prev:
+            continue
+        prev = (desc, cost)
+        if desc and not cost:
+            if "dsHeader" in safe(c["description"], ""):
+                # Context header (Agents of the Imperium "Detachment" vs "Assigned
+                # Agent" pricing): scopes every tier below it until the next one.
+                context = desc
+                continue
+            desc = desc.capitalize() if desc.isupper() else desc
+            if context and not desc.lower().startswith("wargear"):
+                desc = f"{context} — {desc}"
+            if label is not None or items:
+                tiers.append((label, items))
+            label, items = desc, []
+        elif desc:
+            items.append(f"- {desc}: **{cost} pts**")
+        elif cost:
+            items.append(f"- {cost} pts")
+    tiers.append((label, items))
+
+    lines, seen = [], set()
+    for label, items in tiers:
+        key = (label, tuple(items))
+        if key in seen or not items:
+            continue
+        seen.add(key)
+        if label:
+            lines.append(f"**{label}:**")
+        lines.extend(items)
+    return lines
+
 # ── Unit block builder ────────────────────────────────────────────────────────
 
 def build_unit_block(ds_row, dfs):
@@ -197,6 +275,9 @@ def build_unit_block(ds_row, dfs):
     # ── Header ──
     lines.append(f"# {name}")
     lines.append(f"**Faction:** {fname}  |  **Role:** {role}  |  **Source:** {source_id}")
+    # 11e: a support unit must be attached to a bodyguard unit (Muster Armies).
+    if safe(ds_row.get("is_support", ""), "").lower() == "true":
+        lines.append("**Support Unit:** Yes")
     if ver_date:
         lines.append(
             f"**Version/Errata Date:** {ver_date}" + (" *(errata)*" if is_errata else "")
@@ -243,19 +324,16 @@ def build_unit_block(ds_row, dfs):
 
     # ── Points costs ──
     costs_df   = dfs["costs"]
+    # Numeric sort: "line" is read as str, and a lexical sort ("1","10","2") would
+    # move 11e price rows under the wrong tier label (10e tables are <=4 rows).
     unit_costs = (
-        costs_df[costs_df["datasheet_id"] == ds_id].sort_values("line")
+        costs_df[costs_df["datasheet_id"] == ds_id]
+        .sort_values("line", key=lambda col: pd.to_numeric(col, errors="coerce"))
         if not costs_df.empty else pd.DataFrame()
     )
     if not unit_costs.empty:
         lines.append("## Points Costs")
-        for _, c in unit_costs.iterrows():
-            desc = strip_html(safe(c["description"], ""))
-            cost = safe(c["cost"], "")
-            if desc and cost:
-                lines.append(f"- {desc}: **{cost} pts**")
-            elif cost:
-                lines.append(f"- {cost} pts")
+        lines.extend(points_lines(unit_costs))
         lines.append("")
 
     # ── Wargear / weapons ──
@@ -440,6 +518,13 @@ def build_enhancement_block(row, factions_df):
     lines.append(f"**Faction:** {fname}  |  **Cost:** {cost} pts")
     if detachment and detachment != "—":
         lines.append(f"**Detachment:** {detachment}")
+    # 11e: Upgrades are a type of enhancement (up to three of the same in an army);
+    # support_leader lists the units a support-unit bearer can lead.
+    if safe(row.get("upgrade", ""), "").lower() == "true":
+        lines.append("**Upgrade:** Yes")
+    support = strip_html(safe(row.get("support_leader", ""), ""))
+    if support and support != "—":
+        lines.append(support)
     if legend and legend != "—":
         lines.append(f"*{legend}*")
     lines.append("")
@@ -474,8 +559,12 @@ def build_army_rule_block(name, legend, description, faction_names):
 
 # ── Detachment-rule block builder ─────────────────────────────────────────────
 
-def build_detachment_rule_block(row, factions_df):
-    """One detachment rule (e.g. Armoured Wrath) from Detachment_abilities.csv."""
+def build_detachment_rule_block(row, factions_df, detachments_df=None):
+    """One detachment rule (e.g. Armoured Wrath) from Detachment_abilities.csv.
+
+    detachments_df (Detachments.csv) supplies 11e's per-detachment Detachment
+    Points cost and force disposition; 10e has neither column, so nothing is added.
+    """
     faction_id  = safe(row.get("faction_id", ""), "")
     fname       = faction_name(faction_id, factions_df)
     name        = safe(row["name"])
@@ -489,6 +578,19 @@ def build_detachment_rule_block(row, factions_df):
     if detachment and detachment != "—":
         header += f"  |  **Detachment:** {detachment}"
     lines.append(header)
+    det_id = safe(row.get("detachment_id", ""), "")
+    if detachments_df is not None and not detachments_df.empty and det_id:
+        match = detachments_df[detachments_df["id"] == det_id]
+        if not match.empty:
+            dp   = safe(match.iloc[0].get("dp", ""), "")
+            disp = safe(match.iloc[0].get("force_disposition", ""), "")
+            extra = []
+            if dp and dp != "—":
+                extra.append(f"**Detachment Points (DP):** {dp}")
+            if disp and disp != "—":
+                extra.append(f"**Force Disposition:** {disp}")
+            if extra:
+                lines.append("  |  ".join(extra))
     if legend and legend != "—":
         lines.append(f"*{legend}*")
     lines.append("")
@@ -618,7 +720,7 @@ def run(force=False, edition="10e"):
     # ── Detachment-rule blocks ──
     for _, row in dfs["detachment_abilities"].iterrows():
         det_id  = safe(row["id"])
-        content = build_detachment_rule_block(row, dfs["factions"])
+        content = build_detachment_rule_block(row, dfs["factions"], dfs["detachments"])
         path    = blocks_dir / f"detachment_rule_{det_id}.md"
         emitted.add(path.name)
         if write_if_changed(path, content, manifest, force):

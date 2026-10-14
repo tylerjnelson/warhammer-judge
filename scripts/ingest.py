@@ -221,6 +221,29 @@ def split_subrules(content):
             subs.append((name, body))
     return parent, subs
 
+FAQ_Q = re.compile(r"^Q:\s*\|?\s*")
+
+def split_faq(content):
+    """
+    Split an FAQ page block (>=4 'Q:' lines) into (parent_body, [qa_text, ...]),
+    one entry per question with its answer lines. 11e's core-rules page carries a
+    ~30-question FAQ section (~15K chars); as one chunk the embedder only sees its
+    first few questions (MiniLM truncates at ~256 tokens). Rules that carry 2-3
+    attached FAQs stay whole with their rule. 10e has no FAQ-shaped files.
+    """
+    lines = [l for l in content.splitlines() if l.strip() != "Show"]   # "Show" = expander UI
+    idxs  = [i for i, l in enumerate(lines) if FAQ_Q.match(l.strip())]
+    if len(idxs) < 4:
+        return None, []
+    parent = "\n".join(lines[:idxs[0]]).strip()
+    qas    = []
+    for j, start in enumerate(idxs):
+        end  = idxs[j + 1] if j + 1 < len(idxs) else len(lines)
+        body = "\n".join(l for l in lines[start:end] if l.strip()).strip()
+        if body:
+            qas.append(body)
+    return parent, qas
+
 def build_rules_chunks(filepath, content, base_meta, edition_code):
     """
     Expand a Core_Rules / mission-pack file into ingest chunks:
@@ -251,6 +274,22 @@ def build_rules_chunks(filepath, content, base_meta, edition_code):
             meta["breadcrumb"] = f"{clean['breadcrumb']} > {name}"
             meta["card_name"]  = name
             out.append((f"{base_id}_card{i}", body, meta))
+        return out
+
+    # FAQ pages: one chunk per question (the header/parent keeps the file's intro).
+    parent_body, qas = split_faq(content)
+    if qas:
+        out = []
+        if parent_body:
+            out.append((base_id, parent_body, dict(clean)))
+        for i, qa in enumerate(qas):
+            meta = dict(clean)
+            meta.pop("section_group", None)
+            meta.pop("seq", None)
+            meta["breadcrumb"] = f"{clean['breadcrumb']} > Q&A {i + 1}"
+            out.append((f"{base_id}_faq{i}",
+                        f"# {heading} — Q&A\n**Category:** {category}  |  **Source:** {source_id}\n\n{qa}",
+                        meta))
         return out
 
     # Sub-rule split: files bundling >=2 ALL-CAPS-named sub-rules (e.g.
