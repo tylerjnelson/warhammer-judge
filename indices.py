@@ -28,7 +28,8 @@ import config
 
 @st.cache_resource
 def named_rule_index(edition: str) -> list[tuple]:
-    """[(name, detach, doc, meta), ...] for every Army_Rule / Detachment_Rule, with
+    """[(name, detach, doc, meta), ...] for every Army_Rule / Detachment_Rule (plus
+    distinctively-named Enhancements, see _named_enhancements), with
     the rule name and detachment name PRE-PARSED and lowercased. Built once from a
     single col.get over the two categories (mirrors get_dep_index); the per-query
     retrieve_named_rules then collapses to substring tests over this list instead of
@@ -54,7 +55,38 @@ def named_rule_index(edition: str) -> list[tuple]:
                          if app._RULE_DETACH_RE.search(l)), None)
         detach   = m_detach.group(1).strip().lower() if m_detach else ""
         index.append((name, detach, doc, meta))
+    index.extend(_named_enhancements(coll, edition))
     return index
+
+
+def _named_enhancements(coll, edition: str) -> list[tuple]:
+    """Enhancements for the name-gated slice, same tuple shape with detach="" — naming
+    a detachment must not drag in every enhancement it offers. Only DISTINCTIVE names
+    are indexed, since the slice matches by substring: multi-word names, or single
+    words of 9+ chars (drops plain words like "Resolute"/"Celerity"/"Stalker"), and
+    never a name that is also a datasheet ("Immolator", "Magos") — that query is a
+    unit lookup."""
+    try:
+        got = coll.get(where={"category": "Enhancement"}, include=["documents", "metadatas"])
+    except Exception:
+        return []
+    # Datasheet names only — Enhancement chunks carry their OWN name in unit_name, so
+    # unit_army_map (every unit_name) would exclude every enhancement.
+    try:
+        ds = coll.get(where={"category": "Datasheet"}, include=["metadatas"])
+        units = {(m.get("unit_name") or "").lower() for m in ds.get("metadatas", [])}
+    except Exception:
+        units = set()
+    out = []
+    for doc, meta in zip(got.get("documents", []), got.get("metadatas", [])):
+        first = doc.splitlines()[0] if doc else ""
+        if not first.startswith("# Enhancement:"):
+            continue
+        name = first.split(":", 1)[1].strip().lower()
+        if name in units or not (" " in name or len(name) >= 9):
+            continue
+        out.append((name, "", doc, meta))
+    return out
 
 
 @st.cache_resource

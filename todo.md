@@ -30,9 +30,20 @@ All Stage-1 plumbing is built and live. **2026-10-14: 11e corpus BUILT** (collec
     (`stratagem_000010748005`) and swept the junk `stratagem_Shooting phase.md`
     (re-ingested 2026-10-14; audit unchanged: 93/98 core, 67/84 Leviathan, fidelity clean).
   - `eval_fidelity.py --edition 11e`: 100% accuracy on all three sources, 98%+ coverage.
-  **Remaining:** (a) build an 11e eval set (retrieval cases + a graded question set —
-  the 43-Q set is 10e-specific); (b) flip `EDITIONS["11e"]["active"] = True`; later the
-  default. → `spec/dual-edition.md` §11.4–11.7
+  - **11e eval (2026-10-14):** `tests/manual/eval_suites_11e.py` (47 Q: CORE 15 · MISSIONS 10
+    · UNITS 6 · ILLEGAL 6 · ARMY_DETACHMENT 6 · POINTS 4; answer key targets 10e-memory traps).
+    Retrieval `eval_quality.py --edition 11e` **46/47**; prod gpt-oss-120b hand-graded **45/47**
+    (`collect_model_answers.py --edition 11e --no-cap` → `grade_prod.py --edition 11e`, ~128K tok).
+    Fixes it drove: Points Costs section chunks (11e), distinctive enhancement names in the
+    named-rule slice (both editions; 10e gates unchanged 23/23 · 43/43), `dep_graph_11e.json`.
+  **Remaining:** flip `EDITIONS["11e"]["active"] = True` (later the default) → `spec/dual-edition.md` §11.5.
+- **[P2] 11e Fight-order two-hop gap (eval Q27).** Ability → Fights First → *3. Fight Step*
+  (the "starting with the player whose turn it is" alternation). The `fights_first → 3_fight_step`
+  edge exists but the parent (cos 0.20 < 0.30) and span gate (0.37 < 0.45) block it, and seeding
+  is depth-1 by design; the model then invented a selection rule. Options: let a seeded
+  referenced rule seed its own graph deps, or per-edition gate values.
+- **[P3] 11e Desperate Escape answer omits the per-model hazard rolls (eval Q4)** — context had
+  them; a model-completeness slip, watch on re-runs.
 - **[P3] 11e Deployment cards are map images only** (6 cards) — zone geometry isn't in
   text; the Deployment Card Key defines zones/objectives. Nothing to scrape today.
 - **[P2] 11e maintenance dependency:** if 11e introduces a *new faction-bearing category*

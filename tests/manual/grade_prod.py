@@ -57,6 +57,9 @@ def anchor_hit(answer: str, group: list) -> bool:
     return any(s.lower() in low for s in group)
 
 
+ANSWER_KEY = {}   # per-question must / must_not regexes (11e set; see --edition)
+
+
 def grade(q: dict, model: str) -> tuple[str, list]:
     res = (q.get("answers") or {}).get(model)
     if not res:
@@ -83,7 +86,19 @@ def grade(q: dict, model: str) -> tuple[str, list]:
             notes.append(f"VP MISS: expected {exp['want']}VP not found")
         elif exp["avoid_ruling"] and re.search(rf"\b{exp['avoid_ruling']}\s*VP\b", rl, re.I):
             notes.append(f"VP MISS: ruling line still shows {exp['avoid_ruling']}VP")
-    status = "OK" if not notes else ("FLAG" if any(n.startswith(("TRUNC", "EMPTY", "VP MISS", "REFUS")) for n in notes) else "REVIEW")
+    key = ANSWER_KEY.get(q["idx"])
+    if key:
+        # Models emit typographic dashes ("1‑5", "fall‑back": U+2011/2010/2013) — fold
+        # them to "-" so the answer-key patterns match the words, not the glyphs.
+        ans = re.sub(r"[\u2010\u2011\u2012\u2013\u2014]", "-", ans)
+        for pat in key.get("must", []):
+            if not re.search(pat, ans, re.I):
+                notes.append(f"FACT MISS: answer lacks /{pat}/")
+        rl = ruling_line(ans)
+        for pat in key.get("must_not", []):
+            if re.search(pat, rl, re.I):
+                notes.append(f"FACT MISS: ruling line states /{pat}/")
+    status = "OK" if not notes else ("FLAG" if any(n.startswith(("TRUNC", "EMPTY", "VP MISS", "REFUS", "FACT MISS")) for n in notes) else "REVIEW")
     return status, notes
 
 
@@ -91,7 +106,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", default="model_eval_verify")
     ap.add_argument("--model", default="openai/gpt-oss-120b")
+    ap.add_argument("--edition", default="10e",
+                    help="11e: grade against eval_suites_11e.ANSWER_KEY instead of the 10e VP checks")
     args = ap.parse_args()
+
+    global VP_EXPECT, ANSWER_KEY
+    if args.edition == "11e":
+        from tests.manual.eval_suites_11e import ANSWER_KEY as KEY_11E
+        VP_EXPECT, ANSWER_KEY = {}, KEY_11E
 
     path = HERE / f"{args.inp}.json"
     if not path.exists():

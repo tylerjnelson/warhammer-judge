@@ -30,7 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 import app, config, retrieval, serving
 from openai import OpenAI, RateLimitError
-from tests.manual.eval_quality import SUITES, BUDGET, TOK
+from tests.manual.eval_quality import BUDGET, TOK, suites_for
 
 EDITION = "10e"
 OUT_JSON = Path(__file__).resolve().parent / "model_eval_results.json"
@@ -162,12 +162,15 @@ def main():
                                               "use a distinct stem to keep a prior run's baseline intact")
     ap.add_argument("--no-cap", action="store_true",
                     help="omit max_completion_tokens (mirror prod; Groq applies a per-model default)")
+    ap.add_argument("--edition", default="10e",
+                    help="question set + corpus (11e: tests/manual/eval_suites_11e.py)")
     ap.add_argument("--tpm-room", action="store_true",
                     help="per-model cap sized to each model's TPM so no legit answer truncates")
     args = ap.parse_args()
 
-    global MODELS, OUT_JSON, OUT_MD, CAP_MODE
+    global MODELS, OUT_JSON, OUT_MD, CAP_MODE, EDITION
     CAP_MODE = "tpm" if args.tpm_room else "omit" if args.no_cap else "fixed"
+    EDITION  = args.edition
     if args.models:
         MODELS = [m.strip() for m in args.models.split(",") if m.strip()]
     if args.out:
@@ -184,7 +187,7 @@ def main():
 
     # Flatten questions (carry suite + mp + concept groups for the report).
     flat = []
-    for suite, cases, mp in SUITES:
+    for suite, cases, mp in suites_for(EDITION):
         for c in cases:
             flat.append((suite, c[0], c[1], mp))
     sel = flat[args.start:args.start + args.count]
@@ -229,7 +232,7 @@ def main():
         # checkpoint after each question (drop the non-serializable messages).
         # Preserve the full model roster in meta even on a restricted backfill run.
         save = {"meta": {**data.get("meta", {}), "budget": BUDGET, "max_out": MAX_OUT,
-                         "cap_mode": CAP_MODE},
+                         "cap_mode": CAP_MODE, "edition": EDITION},
                 "questions": [{k: v for k, v in qq.items() if k != "_messages"}
                               for qq in data["questions"]]}
         OUT_JSON.write_text(json.dumps(save, indent=1))

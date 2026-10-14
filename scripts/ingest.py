@@ -377,7 +377,12 @@ SECTION_TYPES = [
     ("composition",  "Unit Composition"),
     ("options",      "Wargear Options"),
     ("damaged",      "Damaged"),
+    ("points",       "Points Costs"),
 ]
+# Section types an edition does NOT get. 11e prices units by quantity tier, so a focused
+# points chunk lets "how many points is X" reach the price table instead of losing the
+# unit slice's two slots to ability chunks. 10e (frozen, eval-tuned) is left as it was.
+SECTION_TYPES_SKIP = {"10e": {"points"}}
 
 def extract_sections(content, base_meta):
     """
@@ -392,7 +397,10 @@ def extract_sections(content, base_meta):
     army      = base_meta.get("army", "")
     base_id   = base_meta.get("doc_id", "")
 
+    skip = SECTION_TYPES_SKIP.get(base_meta.get("edition", "10e"), set())
     for section_type, heading in SECTION_TYPES:
+        if section_type in skip:
+            continue
         # Match from the heading to the next ## heading or end of document
         pattern = rf'## {re.escape(heading)}\n(.*?)(?=\n## |\Z)'
         match   = re.search(pattern, content, re.DOTALL)

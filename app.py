@@ -770,6 +770,8 @@ _DEP_SURFACE = {
     "engagement_range":     r"engagement range",
     "unit_coherency":       r"coherency",
     "charging_with_a_unit": r"charge move|charging",
+    # 11e stems (data/dep_graph_11e.json)
+    "3_fight_step":         r"fights first combats|fight step",
 }
 
 def _dep_surface_re(dep_stem: str):

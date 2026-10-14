@@ -25,7 +25,8 @@ verified to exist in data/rule_blocks/10e before being added here.
 This is a quality REPORT (per-question + per-group accuracy, seeded deps, latency,
 token budget); the hard pass/fail regression gate stays tests/verify/eval_retrieval.py.
 
-Run:  python tests/manual/eval_quality.py
+Run:  python tests/manual/eval_quality.py                 # 10e (this file's suites)
+      python tests/manual/eval_quality.py --edition 11e   # tests/manual/eval_suites_11e.py
 """
 import logging, sys, time, warnings
 from collections import Counter
@@ -285,9 +286,26 @@ def grade_checks(unit_dist, checks):
     return fails
 
 
+def suites_for(edition):
+    """The question set for an edition: this file's SUITES for 10e, the 11e set
+    from eval_suites_11e.py. Same (name, cases, mission_pack_mode) contract."""
+    if edition == "10e":
+        return SUITES
+    if edition == "11e":
+        from tests.manual.eval_suites_11e import SUITES as SUITES_11E
+        return SUITES_11E
+    raise SystemExit(f"no eval suites for edition {edition!r}")
+
+
 def main():
+    global EDITION
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--edition", default="10e")
+    EDITION = ap.parse_args().edition
+    suites = suites_for(EDITION)
     app.get_reranker(); app.get_embedder()      # warm so first timing isn't cold load
-    total_q = sum(len(c) for _, c, _ in SUITES)
+    total_q = sum(len(c) for _, c, _ in suites)
     print("=" * 80)
     print(f"{total_q}-QUESTION RETRIEVAL EVAL — {config.RERANK_MODEL}")
     print(f"pool={config.RERANK_CANDIDATES}  budget={BUDGET} tok  edition={EDITION}")
@@ -301,7 +319,7 @@ def main():
     grand_pass = grand_total = grand_balloon = grand_maxtok = 0
     grp_pass = grp_total = 0
 
-    for suite_name, cases, mp_mode in SUITES:
+    for suite_name, cases, mp_mode in suites:
         print(f"\n{'#'*80}\n# {suite_name}  (mission_pack={'ON' if mp_mode else 'OFF'})  "
               f"— {len(cases)} questions\n{'#'*80}")
         s_pass = 0
