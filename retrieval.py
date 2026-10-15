@@ -110,6 +110,9 @@ def seed_dependencies(ctx: RetrievalContext) -> None:
     """Seed the rules a surfaced chunk depends on (definitions + referenced rules), span-
     bridge gated, into the main pool BEFORE rerank."""
     import app
+    # Pointer targets join the RULES pool (reserved rule slots) — see seed_pointer_targets.
+    ctx.rules = ctx.rules + app.seed_pointer_targets(
+        ctx.rerank_query, ctx.main + ctx.rules, ctx.edition, ctx.mission_pack_mode)
     pool = ctx.main + ctx.rules
     ctx.main = (ctx.main
                 + app.seed_definitions(ctx.rerank_query, pool, ctx.edition, ctx.mission_pack_mode)

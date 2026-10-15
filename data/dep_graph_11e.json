@@ -7,12 +7,18 @@
     "edges": {
       "fights_first -> 3_fight_step": "'See the Resolve Fights First Combats step in the Fight phase (12.04)' \u2014 the alternation order lives only in 3. Fight Step",
       "2_charge_step -> engagement": "'a unit cannot be within engagement range (2\") when it attempts a charge' \u2014 engagement range is defined in Engagement"
-    }
+    },
+    "pointers": "_pointers: parent rules that are ONLY a cross-reference to the dep. When the query names the parent (its surface form) and the parent is in the pool, the dep is seeded with the cosine + span gates bypassed (seed_definitions)."
   },
   "fights_first": [
     "3_fight_step"
   ],
   "2_charge_step": [
     "engagement"
-  ]
+  ],
+  "_pointers": {
+    "fights_first": [
+      "3_fight_step"
+    ]
+  }
 }

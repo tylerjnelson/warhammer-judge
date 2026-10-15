@@ -944,6 +944,35 @@ def _gate_and_build(dep_parents: dict, dep_bridge: dict, seed: dict,
     return out
 
 
+def seed_pointer_targets(query: str, pool: list, edition: str, mission_pack_mode: bool) -> list:
+    """Seed the target of a POINTER rule the query names (get_dep_pointers): a rule
+    whose text is only a cross-reference — 11e Fights First "…is a Fights First unit.
+    See the Resolve Fights First Combats step" — can't be applied without its target
+    (3. Fight Step: who selects first, the alternation). The parent's cosine and the
+    span bridge can't measure that (a pointer has no content of its own), so the
+    signal is the user NAMING the pointer rule while it is in the pool; the target is
+    seeded ungated. Depth-1, ratified edges only, DEP_BOOST_MAX-bounded, mission-pack
+    filtered. The caller adds these to the RULES pool: the target is part of the rule
+    the user named, so it competes for the reserved rule slots (riding just below its
+    parent via rank_seeded_below_parents), not the discretionary fill."""
+    pointers = get_dep_pointers(edition)
+    if not pointers:
+        return []
+    bc_to_stem, seed = get_dep_index(edition)
+    allowed = _dep_boost_cats(edition, mission_pack_mode)
+    present = {content_key(c) for c in pool}
+    dep_parents: dict = {}
+    for c in pool:
+        if c["metadata"].get("category") not in allowed:
+            continue
+        pstem = bc_to_stem.get(c["metadata"].get("breadcrumb"))
+        if pstem in pointers and _dep_surface_re(pstem).search(query):
+            for d in pointers[pstem]:
+                dep_parents.setdefault(d, set()).add(content_key(c))
+    return _gate_and_build(dep_parents, {d: 1.0 for d in dep_parents}, seed,
+                           allowed, present, gate=0.0)
+
+
 def seed_definitions(query: str, pool: list, edition: str, mission_pack_mode: bool) -> list:
     """Seed child-definition chunks a surfaced parent RULE references but doesn't
     contain (charge_phase → engagement_range, unit_coherency), from the ratified dep
@@ -1289,20 +1318,29 @@ def _dep_boost_cats(edition: str, mission_pack_mode: bool) -> set:
     return {"Core_Rules"} | ({mp} if mission_pack_mode else set())
 
 @st.cache_resource
-def get_dep_graph(edition: str) -> dict:
-    """Load the ratified dependency-graph artifact: stem -> [dep_stem, ...].
-    Absent file ⇒ {} ⇒ the feature no-ops. Keys starting with '_' are metadata."""
+def _load_dep_artifact(edition: str) -> dict:
+    """The raw ratified dependency-graph artifact (data/dep_graph_<edition>.json).
+    Absent / unreadable ⇒ {} ⇒ both views below are empty and seeding no-ops."""
     path = ROOT / config.RULES_DEP_GRAPH_PATH.format(edition=edition)
     if not path.exists():
         log.info("dep graph absent for %s (%s); definition seeding disabled", edition, path)
         return {}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         log.error("dep graph unreadable for %s (%s); definition seeding disabled",
                   edition, path, exc_info=True)
         return {}
-    return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+def get_dep_graph(edition: str) -> dict:
+    """Ratified edges: stem -> [dep_stem, ...]. Keys starting with '_' are metadata."""
+    return {k: v for k, v in _load_dep_artifact(edition).items() if not k.startswith("_")}
+
+def get_dep_pointers(edition: str) -> dict:
+    """Ratified POINTER edges ("_pointers": stem -> [dep_stem, ...]): the parent rule
+    is only a cross-reference to the dep (11e Fights First: "…is a Fights First unit.
+    See the Resolve Fights First Combats step"), so it cannot be applied without it."""
+    return _load_dep_artifact(edition).get("_pointers", {})
 
 @st.cache_resource
 def get_dep_index(edition: str):
