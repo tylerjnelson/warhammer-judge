@@ -116,7 +116,8 @@ def seed_dependencies(ctx: RetrievalContext) -> None:
     pool = ctx.main + ctx.rules
     ctx.main = (ctx.main
                 + app.seed_definitions(ctx.rerank_query, pool, ctx.edition, ctx.mission_pack_mode)
-                + app.seed_referenced_rules(ctx.rerank_query, pool, ctx.edition, ctx.mission_pack_mode))
+                + app.seed_referenced_rules(ctx.rerank_query, pool, ctx.edition, ctx.mission_pack_mode,
+                                            unit_chunks=ctx.units))
 
 
 def rerank(ctx: RetrievalContext) -> None:
@@ -138,7 +139,10 @@ def cap_seeded_below_parents(ctx: RetrievalContext) -> None:
     """Override each seeded dep's score to ride just below its reranked parent (the
     cross-encoder rates a dependency ~0). AFTER rerank, BEFORE assemble."""
     import app
-    app.rank_seeded_below_parents(ctx.main + ctx.rules, ctx.edition, ctx.mission_pack_mode)
+    # ctx.units supplies parent SCORES only (a unit-slice ability can source a seed or a
+    # promotion — see seed_referenced_rules); deps themselves live in main / rules.
+    app.rank_seeded_below_parents(ctx.main + ctx.rules + ctx.units, ctx.edition,
+                                  ctx.mission_pack_mode)
 
 
 def assemble(ctx: RetrievalContext) -> None:

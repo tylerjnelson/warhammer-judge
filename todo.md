@@ -41,8 +41,22 @@ All Stage-1 plumbing is built and live. **2026-10-14: 11e corpus BUILT** (collec
     its target is seeded ungated into the RULES pool — fixed Q27 (fight order; the model had
     invented a selection rule). 10e has no pointer edges, so it is unaffected.
   **Remaining:** flip `EDITIONS["11e"]["active"] = True` (later the default) → `spec/dual-edition.md` §11.5.
-- **[P3] 11e Desperate Escape answer omits the per-model hazard rolls (eval Q4)** — context had
-  them; a model-completeness slip, watch on re-runs.
+- **11e miss-fixing round (2026-10-15)** — retrieval still 47/47; targeted re-asks on prod:
+  - Q4 (desperate escape) FIXED: 11e definition boxes (`str11Wrap`: every move/shooting/fight
+    type + all 10 core stratagems) are now their own structured sections
+    (`scrape_rules.extract_definition_boxes`) instead of flattened into neighbours; box-attached
+    errata kept. Max 11e context 3477 → 1946 tok.
+  - Q31 (Trukk rapid disembark) FIXED: 11e move-mode names in `_USR_RULES`; rule lookup prefers an
+    exact name (also fixed lone operative / precision / devastating wounds → Appendix mis-maps).
+  - Q29 resolver FIXED ("Intercessors" no longer pinned to the jump-pack unit — token→datasheet
+    must be unique by STEM, both editions); unit-slice abilities can seed referenced rules
+    (span-bridged); a seeder dep that was already retrieved is PROMOTED under its strongest
+    parent. Assault Disembark Move now reaches context.
+- **[P2] Q29 still not concluded by the model** — context has Assault Ramp + Assault Disembark
+  (no charge restriction) + Shock Disembark (restriction, for contrast), yet gpt-oss-120b says the
+  rules "do not give them the right" to charge. Same prompt-induced over-refusal class as the qwen
+  A/B (rules 4/6) → the deferred prompt-v1 change (§2). 11e's default-eligible, restriction-listed
+  move types may hit this more often than 10e.
 - **[P3] 11e Deployment cards are map images only** (6 cards) — zone geometry isn't in
   text; the Deployment Card Key defines zones/objectives. Nothing to scrape today.
 - **[P2] 11e maintenance dependency:** if 11e introduces a *new faction-bearing category*

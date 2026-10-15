@@ -204,12 +204,21 @@ def get_unit_name_resolver(edition: str):
         df = pd.read_csv(csv_path, sep="|", encoding="utf-8-sig", dtype=str)
         names = sorted({str(n).strip() for n in df["name"].dropna() if str(n).strip()},
                        key=len, reverse=True)
-    tok2names = defaultdict(set)
+    tok2names  = defaultdict(set)
+    stem2names = defaultdict(set)
     for nm in names:
         for t in set(re.findall(r"[a-z0-9]+", nm.lower())):
             if t in tokens:
                 tok2names[t].add(nm)
-    token_to_name = {t: next(iter(ns)) for t, ns in tok2names.items() if len(ns) == 1}
+                stem2names[_light_stem(t)].add(nm)
+    # Unique by STEM, not just by surface form: "intercessors" (plural) sits in only
+    # one name (Assault Intercessors With Jump Packs) but its stem is shared with
+    # Intercessor Squad / Heavy Intercessor Squad / Assault Intercessor Squad, so a
+    # query saying "Intercessors" was silently pinned to the jump-pack unit. Same for
+    # ogryns, shields, rider, assassins, infiltrators … — no guess beats a wrong one.
+    # Single-word datasheet names ("Tzaangors") still resolve via the full-name match.
+    token_to_name = {t: next(iter(ns)) for t, ns in tok2names.items()
+                     if len(ns) == 1 and len(stem2names[_light_stem(t)]) == 1}
     return names, token_to_name
 
 def resolve_named_units(query: str, edition: str) -> list[str]:

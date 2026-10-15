@@ -187,6 +187,111 @@ WAHAPEDIA_CARD_CLASSES = (
     "stratText", "stratLegend",
 )
 
+def _str11_lines(text_el):
+    """Lines for an 11e definition box body: one line per labelled step (WHEN: /
+    ELIGIBLE IF: / BEFORE MOVING: …, delimited by <br> and str11Line rules) and one
+    "- " line per list item — so a mode's clause ("Desperate Escape: … Make a hazard
+    roll for each model") stays visibly attached to its mode instead of running into
+    the next step."""
+    lines, buf = [], []
+
+    def flush():
+        text = clean_text(" ".join(buf))
+        buf.clear()
+        if text:
+            lines.append(text)
+
+    for ch in text_el.children:
+        if isinstance(ch, Comment):
+            continue
+        if isinstance(ch, NavigableString):
+            buf.append(str(ch))
+            continue
+        cls = ch.get("class", [])
+        if ch.name == "br" or "str11Line" in cls:
+            flush()
+        elif ch.name in ("ul", "ol"):
+            flush()
+            for li in ch.find_all("li", recursive=False):
+                item = clean_text(li.get_text(separator=" "))
+                if item:
+                    lines.append(f"- {item}")
+        elif ch.name == "table" or ch.find("table"):
+            flush()
+            lines.extend(prose_and_tables_in_order(ch))
+        elif ch.name == "div":                       # strGreyBg (MAXIMUM DISTANCE) etc.
+            flush()
+            buf.append(ch.get_text(separator=" "))
+            flush()
+        else:                                        # inline b / a / span / u
+            buf.append(ch.get_text(separator=" "))
+    flush()
+    return lines
+
+
+def extract_definition_boxes(soup, page_config):
+    """11e rule-definition boxes (str11Wrap): every move type (Normal / Advance /
+    Fall-back / Charge / Pile-in / Disembark / Ingress / Surge / Scout …), shooting
+    type, fight type and core stratagem. Each is a self-contained rule, but the walks
+    below flatten it into one run and file it under whatever heading preceded it
+    ("3. End of Movement Phase"). Emit each as its own section — title from the box
+    name, "*type · CP*" meta line, structured body — and remove the boxes from the
+    soup so they aren't also folded into a neighbour. First occurrence of a name wins
+    (hover-tooltip copies are already stripped by REMOVE_SELECTORS)."""
+    sections, seen = [], set()
+    prefix, category, source = page_config["prefix"], page_config["category"], page_config["source"]
+    boxes = soup.find_all("div", class_="str11Wrap")
+    for wrap in boxes:
+        name_el = wrap.find(class_="str11Name")
+        title   = clean_text(name_el.get_text(" ")).title() if name_el else ""
+        body_el = wrap.find(class_="str11Text")
+        if not title or body_el is None:
+            continue
+        slug = slugify(title)
+        if slug in seen or is_skipped_slug(slug):
+            continue
+        seen.add(slug)
+        meta = [clean_text(e.get_text(" ")) for e in
+                (wrap.find(class_="str11Type"), wrap.find(class_="str11CP")) if e is not None]
+        meta = [m for m in meta if m]
+        lines = [f"*{' · '.join(meta)}*"] if meta else []
+        legend = wrap.find(class_="str11Legend")
+        if legend is not None and clean_text(legend.get_text(" ")):
+            lines.append(f"> {clean_text(legend.get_text(' '))}")
+        lines.extend(_str11_lines(body_el))
+        # FAQ / errata attached to the box share its BreakInsideAvoid wrapper (Crushing
+        # Impact: "The Tank Shock Stratagem is the same as the Crushing Impact
+        # stratagem.") — they belong to this rule, and the wrapper is removed below.
+        holder = wrap.parent
+        if holder is not None and "BreakInsideAvoid" in holder.get("class", []):
+            for sib in holder.find_all(recursive=False):
+                if sib is wrap or not hasattr(sib, "find_all"):
+                    continue
+                for ui in sib.select(".btnFaqErrataToggle"):      # "Show"/"Hide" toggle
+                    ui.decompose()
+                heads = sib.select(".errata_H")
+                if heads:                                         # "Errata: <title>" / text
+                    for h in heads:
+                        body = h.find_next_sibling(class_="errata")
+                        lines.append(f"Errata: {clean_text(h.get_text(' '))}")
+                        if body is not None:
+                            lines.append(clean_text(body.get_text(separator=" ")))
+                else:
+                    lines.extend(prose_and_tables_in_order(sib))
+        sections.append((f"{prefix}_{slug}.md",
+                         f"# {title}\n**Category:** {category}  |  **Source:** {source}\n\n"
+                         + "\n".join(lines)))
+    for wrap in boxes:
+        holder = wrap.parent
+        # the BreakInsideAvoid wrapper exists only to hold the box — drop it with it
+        if holder is not None and "BreakInsideAvoid" in holder.get("class", []) \
+                and len(holder.find_all("div", class_="str11Wrap")) == 1:
+            holder.decompose()
+        else:
+            wrap.decompose()
+    return sections
+
+
 def drop_page_region(soup, start_id, end_id):
     """Remove everything from the heading with id=start_id up to (not including) the
     heading with id=end_id. Used for page regions that are interactive UI rather than
@@ -1146,7 +1251,14 @@ def scrape_page(key, page_config, manifest, blocks_dir, force=False):
     strip_heading_numbers(soup)
     badge_numbers_into_headings(soup)
 
-    sections = split_into_sections(soup, page_config)
+    # 11e definition boxes come out first (and leave the soup) so the section walks
+    # never see them. 10e has no str11 markup; gated anyway like the other v11 fixes.
+    boxes    = extract_definition_boxes(soup, page_config) if page_config.get("v11_markup") else []
+    sections = boxes + split_into_sections(soup, page_config)
+    dupes = {f for f in (n for n, _ in sections) if [n for n, _ in sections].count(f) > 1}
+    if dupes:
+        print(f"[WARN] {key}: duplicate section files (last one wins): {sorted(dupes)[:8]}",
+              file=sys.stderr)
 
     written  = 0
     skipped  = 0

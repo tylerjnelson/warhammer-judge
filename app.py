@@ -824,6 +824,17 @@ _USR_RULES = {
     r"\bdevastating wounds\b":                 "devastating wounds",
     r"\bsustained hits\b":                     "sustained hits",
     r"\blethal hits\b":                        "lethal hits",
+    # 11e move-type definitions abilities grant by mode name ("…can make a disembark
+    # move using the rapid disembark mode", "…an assault disembark move"). Absent in
+    # 10e, so these never resolve there.
+    # bare "disembark move" only — not inside "assault/shock/emergency disembark move"
+    r"\b(?:rapid|tactical|combat) disembark\b|(?<!assault )(?<!shock )(?<!emergency )\bdisembark move\b":
+                                                "disembark move",
+    r"\bassault disembark\b":                  "assault disembark move",
+    r"\bshock disembark\b":                    "shock disembark move",
+    r"\bemergency disembark\b":                "emergency disembark move",
+    r"\bsurge move\b":                         "surge move",
+    r"\bscout move\b":                         "scout move",
 }
 
 @st.cache_resource
@@ -834,7 +845,13 @@ def get_rule_name_index(edition: str):
     _, seed = get_dep_index(edition)
     index = []
     for rx, key in _USR_RULES.items():
+        # Exact rule name first, then the first rule whose name CONTAINS the key: in 11e
+        # "lone operative" / "precision" / "devastating wounds" otherwise resolved to
+        # Rules Appendix clarifications ("Attached units and Lone Operative"), and
+        # "disembark move" to whichever of Emergency/Assault/Shock came first.
         stem = next((s for s, p in seed.items()
+                     if rule_display_name(p["metadata"]) == key), None) or \
+               next((s for s, p in seed.items()
                      if key in rule_display_name(p["metadata"])), None)
         if stem:
             index.append((re.compile(rx, re.I), stem))
@@ -917,7 +934,8 @@ def boost_named_ability_matches(query: str, units: list) -> None:
 
 
 def _gate_and_build(dep_parents: dict, dep_bridge: dict, seed: dict,
-                    allowed: set, present: set, gate: float) -> list:
+                    allowed: set, present: set, gate: float,
+                    pool: list | None = None) -> list:
     """Apply the relevance gate and build seed chunks (shared by both seeders).
     `dep_bridge` is the per-dep relevance signal — the span-bridge sentence score
     for definitions, the parent ability's relevance for referenced rules — and a dep
@@ -935,7 +953,15 @@ def _gate_and_build(dep_parents: dict, dep_bridge: dict, seed: dict,
                      prov=Provenance.DEP_SEED, cosine=0.0,
                      parent_keys=tuple(sorted(dep_parents[d])),
                      dep_bridge=round(dep_bridge[d], 3))
-        if content_key(cand) in present:                    # already retrieved
+        if content_key(cand) in present:                    # already retrieved:
+            # PROMOTE the retrieved copies instead of skipping them — a rule the parent
+            # names must not lose its slot just because it also matched densely (11e
+            # Assault Disembark Move at 0.19 under a 1.04 Assault Ramp). The parent-cap
+            # stage lifts a promoted chunk to max(own score, just-below-parent).
+            for ex in (pool or []):
+                if content_key(ex) == content_key(cand) and ex.prov is not Provenance.DEP_SEED:
+                    ex.parent_keys = tuple(sorted(set(ex.parent_keys) | dep_parents[d]))
+                    ex.dep_promote = True
             continue
         present.add(content_key(cand))
         out.append(cand)
@@ -970,7 +996,7 @@ def seed_pointer_targets(query: str, pool: list, edition: str, mission_pack_mode
             for d in pointers[pstem]:
                 dep_parents.setdefault(d, set()).add(content_key(c))
     return _gate_and_build(dep_parents, {d: 1.0 for d in dep_parents}, seed,
-                           allowed, present, gate=0.0)
+                           allowed, present, gate=0.0, pool=pool)
 
 
 def seed_definitions(query: str, pool: list, edition: str, mission_pack_mode: bool) -> list:
@@ -1008,10 +1034,12 @@ def seed_definitions(query: str, pool: list, edition: str, mission_pack_mode: bo
             naming = [e for s, e in zip(sents, embs) if pat.search(s)]
             if naming:
                 dep_bridge[d] = max(dep_bridge.get(d, -1.0), max(_cos(qv, e) for e in naming))
-    return _gate_and_build(dep_parents, dep_bridge, seed, allowed, present, config.SPAN_GATE_MIN)
+    return _gate_and_build(dep_parents, dep_bridge, seed, allowed, present, config.SPAN_GATE_MIN,
+                           pool=pool)
 
 
-def seed_referenced_rules(query: str, pool: list, edition: str, mission_pack_mode: bool) -> list:
+def seed_referenced_rules(query: str, pool: list, edition: str, mission_pack_mode: bool,
+                          unit_chunks: list | None = None) -> list:
     """Seed core/Leviathan rule chunks that surfaced UNIT/ABILITY chunks reference BY
     NAME, as the rules context needed to understand those abilities (and unit-vs-unit
     interactions). Parent = a surfaced non-rule chunk; dep = the USR it names.
@@ -1026,6 +1054,11 @@ def seed_referenced_rules(query: str, pool: list, edition: str, mission_pack_mod
         passes the relevance pre-filter and would otherwise seed every weapon keyword in
         its wargear table ([SUSTAINED HITS], [DEADLY DEMISE]) on an unrelated question
         ("can it charge"). A wargear-table row scores ~0.1 against such a query → dropped.
+      • unit-slice ABILITY (`unit_chunks`) → SPAN-BRIDGE gated too. The slice fetches a
+        named unit's abilities by metadata (cosine 0.0, and seeding runs before rerank),
+        so they carry no relevance score here — but the ability the question is about
+        ("Assault Ramp … can make an assault disembark move" for "Land Raider makes a
+        Normal move … disembark") matches the query sentence-for-sentence.
     Capped below the parent by rank_seeded_below_parents. See §8e."""
     index = get_rule_name_index(edition)
     if not index:
@@ -1038,6 +1071,23 @@ def seed_referenced_rules(query: str, pool: list, edition: str, mission_pack_mod
 
     dep_parents: dict = {}   # rule_stem -> set(parent content_key)
     dep_bridge:  dict = {}   # rule_stem -> gate score (parent rel for abilities, else span)
+
+    def span_bridge(c, matched):
+        sents, embs = _chunk_sentence_embeddings(c)
+        for rx, rstem in matched:
+            dep_parents.setdefault(rstem, set()).add(content_key(c))
+            naming = [e for s, e in zip(sents, embs) if rx.search(s)]
+            if naming:
+                dep_bridge[rstem] = max(dep_bridge.get(rstem, -1.0),
+                                        max(_cos(qv, e) for e in naming))
+
+    for c in (unit_chunks or []):
+        if c["metadata"].get("category") != "Ability" or content_key(c) in present:
+            continue
+        matched = [(rx, rstem) for rx, rstem in index if rx.search(c["text"])]
+        if matched:
+            span_bridge(c, matched)
+    present |= {content_key(c) for c in (unit_chunks or [])}
     for c in pool:
         cat = c["metadata"].get("category", "")
         if cat in ("Core_Rules", mp_cat):                 # parents here are non-rule only
@@ -1056,15 +1106,9 @@ def seed_referenced_rules(query: str, pool: list, edition: str, mission_pack_mod
         else:
             # stat-block / wargear parent: require the QUERY to be about the naming
             # sentence, else a saturated Datasheet seeds its whole wargear keyword set.
-            sents, embs = _chunk_sentence_embeddings(c)
-            for rx, rstem in matched:
-                dep_parents.setdefault(rstem, set()).add(content_key(c))
-                naming = [e for s, e in zip(sents, embs) if rx.search(s)]
-                if naming:
-                    dep_bridge[rstem] = max(dep_bridge.get(rstem, -1.0),
-                                            max(_cos(qv, e) for e in naming))
+            span_bridge(c, matched)
     return _gate_and_build(dep_parents, dep_bridge, seed, allowed, present,
-                           config.SPAN_GATE_MIN)
+                           config.SPAN_GATE_MIN, pool=pool)
 
 
 def rank_seeded_below_parents(chunks: list, edition: str, mission_pack_mode: bool) -> None:
@@ -1089,6 +1133,19 @@ def rank_seeded_below_parents(chunks: list, edition: str, mission_pack_mode: boo
             continue
         eff = min(ps) - config.RULES_BOOST_DEP - i * config.DEP_SCORE_EPS
         dep["rank_override"] = round(eff, 4)   # boosted_score(dep) == eff (below weakest parent)
+    # Promoted chunks (a seeder's dep that was ALSO retrieved, see _gate_and_build): lift
+    # to just below their STRONGEST parent when that beats their own score; never lower.
+    # Strongest, not weakest: parent_keys holds every chunk that merely NAMES the rule
+    # (incl. weak ones that failed the gate), and the rule already earned candidacy by
+    # retrieval — the one relevant parent (Assault Ramp at 1.04) is the justification.
+    for c in chunks:
+        if getattr(c, "dep_promote", False) and c.parent_keys:
+            ps = [score_by_key[k] for k in c.parent_keys if k in score_by_key]
+            if ps:
+                eff  = max(ps) - config.RULES_BOOST_DEP
+                own  = boosted_score(c, edition, mission_pack_mode)
+                if eff > own:
+                    c.rank_override = round(eff, 4)
 
 
 def _reserve_unit_chunks(unit_chunks: list, reserved_keys: set, rank) -> list:
